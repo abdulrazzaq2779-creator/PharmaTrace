@@ -16,7 +16,7 @@ import { Card } from '../components/Card';
 import { Modal } from '../components/Modal';
 import { Icon } from '../components/Icons';
 import type { AppSettings } from '../types';
-import { APP_VERSION, buildSettingsExport, disclaimerText } from '../data/mockData';
+import { APP_VERSION, disclaimerText } from '../data/content';
 
 interface SettingsScreenProps {
   settings: AppSettings;
@@ -100,7 +100,16 @@ export function SettingsScreen({
 
   const exportData = () => {
     try {
-      const json = buildSettingsExport(localStorage.getItem('pharmatrace-scan-results') ?? '[]', settings);
+      const json = JSON.stringify(
+        {
+          version: APP_VERSION,
+          exportDate: new Date().toISOString(),
+          settings,
+          scanHistory: JSON.parse(localStorage.getItem('pharmatrace-scan-results') ?? '[]'),
+        },
+        null,
+        2
+      );
       const blob = new Blob([json], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement('a');
@@ -221,12 +230,6 @@ export function SettingsScreen({
               iconClass="bg-secondary-100"
             />
             <div className="space-y-4">
-              <ToggleRow
-                label="Auto-save Scans"
-                description="Automatically save scan results to history"
-                checked={settings.autoSave}
-                onChange={value => onUpdateSetting('autoSave', value)}
-              />
               <ToggleRow
                 label="Usage Analytics"
                 description="Help improve the app with anonymous usage data"

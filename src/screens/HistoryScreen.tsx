@@ -7,9 +7,9 @@ import { Input } from '../components/Input';
 import { Modal } from '../components/Modal';
 import { Icon } from '../components/Icons';
 import type { RiskLevel, ScanResult } from '../types';
-import { riskLevelLabels } from '../data/mockData';
+import { riskLevelLabels } from '../data/content';
 import { formatRelativeTime, getRiskLevelIcon } from '../utils/helpers';
-import { summarizeChecks } from '../services/storage';
+import { countStatuses } from '../utils/checks';
 
 interface HistoryScreenProps {
   scanResults: ScanResult[];
@@ -47,12 +47,13 @@ export function HistoryScreen({
   const filtered = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
     return scanResults.filter(scan => {
-      const product = `${scan.extractedData.medicineName ?? ''} ${scan.extractedData.strength ?? ''}`.trim().toLowerCase();
+      const f = scan.extractedData.fields;
+      const product = [f.brand_name?.value, f.composition?.value].filter(Boolean).join(' ').toLowerCase();
       const matchesQuery =
         query === '' ||
         product.includes(query) ||
-        (scan.extractedData.manufacturer ?? '').toLowerCase().includes(query) ||
-        (scan.extractedData.batchNumber ?? '').toLowerCase().includes(query);
+        (f.manufacturer_name?.value ?? '').toLowerCase().includes(query) ||
+        (f.batch_no?.value ?? '').toLowerCase().includes(query);
       const matchesRisk = filterRisk === 'all' || scan.riskLevel === filterRisk;
       return matchesQuery && matchesRisk;
     });
@@ -127,8 +128,11 @@ export function HistoryScreen({
 
           <div className="space-y-3" role="list" aria-label="Scan history">
             {filtered.map(scan => {
-              const productName = `${scan.extractedData.medicineName ?? 'Unknown'} ${scan.extractedData.strength ?? ''}`.trim();
-              const counts = summarizeChecks(scan.checks);
+              const productName =
+                scan.extractedData.fields.brand_name?.value ??
+                scan.extractedData.fields.composition?.value ??
+                'Unidentified pack';
+              const counts = countStatuses(scan.checks);
               return (
                 <Card
                   key={scan.id}
@@ -144,11 +148,7 @@ export function HistoryScreen({
                       aria-label={`Open details for ${productName}`}
                     >
                       <div className="w-16 h-16 rounded-xl bg-gray-100 flex-shrink-0 overflow-hidden relative flex items-center justify-center">
-                        {scan.imageUrl.startsWith('demo://') ? (
-                          <Icon name="pill" size={24} className="text-gray-400" />
-                        ) : (
-                          <img src={scan.imageUrl} alt="" className="w-full h-full object-cover" loading="lazy" />
-                        )}
+                        <img src={scan.imageUrl} alt="" className="w-full h-full object-cover" loading="lazy" />
                         <div className="absolute inset-x-0 bottom-0 bg-black/40 py-0.5 flex items-center justify-center">
                           <Icon name={getRiskLevelIcon(scan.riskLevel)} size={12} className="text-white" />
                         </div>
@@ -166,7 +166,7 @@ export function HistoryScreen({
                             {formatRelativeTime(scan.timestamp)}
                           </span>
                           <span>
-                            {counts.passed} passed · {counts.failed} failed · {counts.needsReview} review
+                            {counts.passed} pass · {counts.failed} fail · {counts.review} review · {counts.unavailable} n/a
                           </span>
                         </div>
                       </div>
@@ -227,7 +227,7 @@ export function HistoryScreen({
             <p className="text-gray-600 mb-6">
               Delete the scan for{' '}
               <span className="font-medium text-gray-900">
-                {pendingDelete.extractedData.medicineName ?? 'Unknown'} {pendingDelete.extractedData.strength ?? ''}
+                {pendingDelete.extractedData.fields.brand_name?.value ?? 'Unidentified pack'}
               </span>
               ?
             </p>

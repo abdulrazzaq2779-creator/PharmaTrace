@@ -1,13 +1,27 @@
 import { useCallback, useState } from 'react';
 import { Camera, History, ScanLine, Settings } from 'lucide-react';
 import { ScanScreen } from './screens/ScanScreen';
+import { CollectScreen } from './screens/CollectScreen';
 import { ResultsScreen } from './screens/ResultsScreen';
 import { HistoryScreen } from './screens/HistoryScreen';
 import { SettingsScreen } from './screens/SettingsScreen';
 import { ErrorBoundary } from './components/ErrorBoundary';
-import { useScanEngine, useScanHistory } from './hooks/useScan';
+import { useScanSession } from './hooks/useScanSession';
 import { useAppSettings } from './hooks/useAppSettings';
-import type { CaptureSource, ScanResult, Screen } from './types';
+import { useScanHistory } from './hooks/useScan';
+import { buildReportText } from './utils/report';
+import type { CaptureSource, FieldKey, ScanResult, Screen } from './types';
+
+/** The key details the progress indicator counts. */
+const KEY_DETAILS: FieldKey[] = [
+  'brand_name',
+  'composition',
+  'manufacturer_name',
+  'batch_no',
+  'mfg_date',
+  'expiry_date',
+  'mrp',
+];
 
 const TABS = [
   { id: 'scan', icon: Camera, label: 'Scan' },
@@ -63,45 +77,75 @@ async function shareOrCopy(report: string, title: string): Promise<'shared' | 'c
 
 function App() {
   const [currentScreen, setCurrentScreen] = useState<Screen>('scan');
-  const [currentScan, setCurrentScan] = useState<ScanResult | null>(null);
-  const { stage, progress, error: scanError, clearError, performScan } = useScanEngine();
-  const { scanResults, historyError, addScan, deleteScan, clearHistory } = useScanHistory();
+  const [finalResult, setFinalResult] = useState<ScanResult | null>(null);
+  const session = useScanSession();
+  const { scanResults, historyError, upsertScan, deleteScan, clearHistory } = useScanHistory();
   const { settings, updateSetting, resetSettings } = useAppSettings();
+
+  const analyzing = session.stage === 'analyzing';
 
   const handleScanComplete = useCallback(
     async (file: File, source: CaptureSource) => {
-      const result = await performScan(file, source);
-      if (result) {
-        setCurrentScan(result);
-        addScan(result, settings.autoSave);
-        setCurrentScreen('results');
+      // startScan returns the outcome; reading session.stage here would be stale.
+      const outcome = await session.startScan(file, source);
+      if (outcome) {
+        if (outcome.stage === 'done' && outcome.final) {
+          setFinalResult(outcome.final);
+          upsertScan(outcome.final);
+          setCurrentScreen('results');
+        } else {
+          setCurrentScreen('collect');
+        }
       }
     },
-    [performScan, addScan, settings.autoSave]
+    [session, upsertScan]
   );
 
-  const handleSelectHistoryItem = useCallback((scan: ScanResult) => {
-    setCurrentScan(scan);
-    setCurrentScreen('results');
-  }, []);
-
-  const handleDeleteFromHistory = useCallback(
-    (id: string) => {
-      deleteScan(id);
-      setCurrentScan(prev => (prev?.id === id ? null : prev));
+  const handleCaptureStep = useCallback(
+    (file: File, stepId: string) => {
+      void session.addPhoto(file, stepId);
     },
-    [deleteScan]
+    [session]
   );
 
-  const handleRescan = useCallback(() => {
-    setCurrentScan(null);
+  const handleFinish = useCallback(() => {
+    const result = session.finish();
+    if (result) {
+      setFinalResult(result);
+      // Every completed scan lands in history automatically (deduped on save).
+      upsertScan(result);
+      setCurrentScreen('results');
+    }
+  }, [session, upsertScan]);
+
+  const handleSaveReport = useCallback(
+    (scan: ScanResult) => {
+      upsertScan(scan);
+    },
+    [upsertScan]
+  );
+
+  /** Manual entries / corrections applied on the results screen. */
+  const handleApplyEdits = useCallback(
+    (edited: ScanResult) => {
+      setFinalResult(edited);
+      upsertScan(edited);
+    },
+    [upsertScan]
+  );
+
+  const handleNewScan = useCallback(() => {
+    session.reset();
+    setFinalResult(null);
     setCurrentScreen('scan');
-  }, []);
+  }, [session]);
 
   const handleShare = useCallback((scan: ScanResult) => {
     const brand = scan.extractedData.fields.brand_name?.value ?? 'Unidentified pack';
     return shareOrCopy(buildReportText(scan), `PharmaTrace Scan: ${brand}`);
   }, []);
+
+  const collectedDetails = KEY_DETAILS.filter(key => session.fields[key]).length;
 
   return (
     <ErrorBoundary>
@@ -110,30 +154,53 @@ function App() {
           {currentScreen === 'scan' && (
             <ScanScreen
               onScanComplete={handleScanComplete}
-              stage={stage}
-              progress={progress}
-              scanError={scanError}
-              onDismissScanError={clearError}
+              isAnalyzing={analyzing}
+              progress={session.progress}
+              scanError={session.error}
+              onDismissScanError={() => session.setError(null)}
+            />
+          )}
+          {currentScreen === 'collect' && (
+            <CollectScreen
+              groups={session.pendingGroups}
+              totalDetails={KEY_DETAILS.length}
+              collectedDetails={collectedDetails}
+              photos={session.photos}
+              error={session.error}
+              onCapture={handleCaptureStep}
+              onEnterManually={session.enterManually}
+              onSkip={session.skipStep}
+              onFinish={handleFinish}
+              canFinish={!analyzing}
             />
           )}
           {currentScreen === 'results' &&
-            (currentScan ? (
+            (finalResult ? (
               <ResultsScreen
-                scanResult={currentScan}
-                onBack={handleRescan}
-                onRescan={handleRescan}
-                onShare={() => handleShare(currentScan)}
+                scanResult={finalResult}
+                onBack={handleNewScan}
+                onRescan={handleNewScan}
+                onShare={() => handleShare(finalResult)}
+                onSaveReport={handleSaveReport}
+                onApplyEdits={handleApplyEdits}
+                onCropRescan={(photoId, crop, stepId) => void session.rescanCrop(photoId, crop, stepId)}
               />
             ) : (
-              <EmptyResults onGoToScan={() => setCurrentScreen('scan')} />
+              <EmptyResults onGoToScan={handleNewScan} />
             ))}
           {currentScreen === 'history' && (
             <HistoryScreen
               scanResults={scanResults}
               historyError={historyError}
               onClearHistory={clearHistory}
-              onSelectScan={handleSelectHistoryItem}
-              onDeleteScan={handleDeleteFromHistory}
+              onSelectScan={scan => {
+                setFinalResult(scan);
+                setCurrentScreen('results');
+              }}
+              onDeleteScan={id => {
+                deleteScan(id);
+                setFinalResult(prev => (prev?.id === id ? null : prev));
+              }}
             />
           )}
           {currentScreen === 'settings' && (
@@ -166,26 +233,6 @@ function EmptyResults({ onGoToScan }: { onGoToScan: () => void }) {
       </div>
     </div>
   );
-}
-
-function buildReportText(scan: ScanResult): string {
-  const f = scan.extractedData.fields;
-  const lines = [
-    'PharmaTrace Scan Report',
-    '=======================',
-    `Brand: ${f.brand_name?.value ?? 'Not found'}`,
-    `Composition: ${f.composition?.value ?? 'Not found'}`,
-    `Manufacturer: ${f.manufacturer_name?.value ?? 'Not found'}`,
-    `Batch: ${f.batch_no?.value ?? 'Not found'}`,
-    `Expiry: ${f.expiry_date?.value ?? 'Not found'}`,
-    `Verdict: ${scan.riskLevel} (analyzer: ${scan.analyzer})`,
-    '',
-    'Checks:',
-    ...scan.checks.map(c => `- [${c.status.toUpperCase()}] ${c.name}: ${c.reason}`),
-    '',
-    'Screening aid only — not a genuineness guarantee.',
-  ];
-  return lines.join('\n');
 }
 
 export default App;

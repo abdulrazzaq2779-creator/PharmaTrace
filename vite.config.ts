@@ -1,6 +1,6 @@
 import react from '@vitejs/plugin-react'
 import { defineConfig } from 'vite'
-import { configureScanApi } from './server/scanApi'
+import { configureScanApi } from './server/scanApi.ts'
 
 // https://vite.dev/config/
 export default defineConfig({

@@ -1,18 +1,20 @@
 /**
- * Real image processing: decoding, resizing, band splitting, rotation,
- * thumbnails and blur estimation. Everything operates on actual pixels.
+ * Real image processing for OCR: decoding, upscaling, preprocessing variants,
+ * rotations, crops, thumbnails and blur estimation. All pixel work, no simulation.
  */
 
 export interface DecodedImage {
-  /** In-memory canvas with the image, longest edge capped at MAX_EDGE. */
   canvas: HTMLCanvasElement;
   width: number;
   height: number;
 }
 
+/** Longest edge for storage/display. */
 export const MAX_EDGE = 1600;
+/** Longest edge targeted for OCR — small text needs the extra pixels. */
+export const OCR_MIN_EDGE = 2000;
 
-/** Decode a File/Blob and downscale so the longest edge is <= MAX_EDGE. */
+/** Decode a File/Blob into a canvas capped at maxEdge on the longest side. */
 export async function decodeImage(file: Blob, maxEdge = MAX_EDGE): Promise<DecodedImage> {
   const bitmap = await createImageBitmap(file);
   try {
@@ -31,18 +33,10 @@ export async function decodeImage(file: Blob, maxEdge = MAX_EDGE): Promise<Decod
   }
 }
 
-/** Encode a canvas as a base64 JPEG data URL. */
 export function canvasToJpeg(canvas: HTMLCanvasElement, quality = 0.9): string {
   return canvas.toDataURL('image/jpeg', quality);
 }
 
-/** Strip the data-URL prefix, leaving pure base64 (for JSON payloads). */
-export function dataUrlToBase64(dataUrl: string): string {
-  const commaIndex = dataUrl.indexOf(',');
-  return commaIndex === -1 ? dataUrl : dataUrl.slice(commaIndex + 1);
-}
-
-/** Small JPEG data URL for history thumbnails. */
 export function makeThumbnail(canvas: HTMLCanvasElement, maxEdge = 320): string {
   const scale = Math.min(1, maxEdge / Math.max(canvas.width, canvas.height));
   const thumb = document.createElement('canvas');
@@ -52,36 +46,161 @@ export function makeThumbnail(canvas: HTMLCanvasElement, maxEdge = 320): string 
   return thumb.toDataURL('image/jpeg', 0.7);
 }
 
-/** Rotate a canvas by 90° clockwise (blister strips often print text sideways). */
-export function rotate90(canvas: HTMLCanvasElement): HTMLCanvasElement {
-  const rotated = document.createElement('canvas');
-  rotated.width = canvas.height;
-  rotated.height = canvas.width;
-  const ctx = rotated.getContext('2d');
+/** Upscale so the longest edge is at least minEdge (OCR needs pixels for small print). */
+export function upscaleForOcr(source: HTMLCanvasElement, minEdge = OCR_MIN_EDGE): HTMLCanvasElement {
+  const longest = Math.max(source.width, source.height);
+  const scale = Math.max(1, minEdge / longest);
+  if (scale === 1) return source;
+  const out = document.createElement('canvas');
+  out.width = Math.round(source.width * scale);
+  out.height = Math.round(source.height * scale);
+  const ctx = out.getContext('2d', { willReadFrequently: true });
   if (ctx) {
-    ctx.translate(rotated.width / 2, rotated.height / 2);
-    ctx.rotate(Math.PI / 2);
-    ctx.drawImage(canvas, -canvas.width / 2, -canvas.height / 2);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(source, 0, 0, out.width, out.height);
   }
-  return rotated;
+  return out;
 }
 
-export interface Band {
-  /** 1-based index in scan order. */
-  index: number;
-  /** Crop of the band, in original-orientation pixels. */
-  canvas: HTMLCanvasElement;
-  /** Vertical extent of the band in the source image. */
-  y0: number;
-  y1: number;
-  /** Extra height this band shares with its neighbor (overlap). */
-  overlapPx: number;
+/** Grayscale + per-channel contrast stretch (1st-99th percentile). */
+export function grayscaleNormalized(source: HTMLCanvasElement): HTMLCanvasElement {
+  const out = document.createElement('canvas');
+  out.width = source.width;
+  out.height = source.height;
+  const ctx = out.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return out;
+  ctx.drawImage(source, 0, 0);
+
+  const img = ctx.getImageData(0, 0, out.width, out.height);
+  const data = img.data;
+  const n = data.length / 4;
+  const hist = new Uint32Array(256);
+  for (let i = 0; i < n; i++) {
+    const gray = (0.299 * data[i * 4] + 0.587 * data[i * 4 + 1] + 0.114 * data[i * 4 + 2]) | 0;
+    data[i * 4] = data[i * 4 + 1] = data[i * 4 + 2] = gray;
+    hist[gray]++;
+  }
+  // Contrast stretch between the 1st and 99th percentiles.
+  let lo = 0;
+  let hi = 255;
+  let acc = 0;
+  const loCut = n * 0.01;
+  const hiCut = n * 0.99;
+  for (let v = 0; v < 256; v++) {
+    acc += hist[v];
+    if (acc < loCut) lo = v;
+    if (acc < hiCut) hi = v;
+  }
+  const range = Math.max(1, hi - lo);
+  for (let i = 0; i < n; i++) {
+    const stretched = Math.max(0, Math.min(255, ((data[i * 4] - lo) * 255) / range));
+    data[i * 4] = data[i * 4 + 1] = data[i * 4 + 2] = stretched;
+  }
+  ctx.putImageData(img, 0, 0);
+  return out;
 }
 
 /**
- * Split an image into horizontal bands (top to bottom) with ~15% overlap
- * so text spanning band boundaries is read at least once fully.
+ * Adaptive threshold via integral image (Bradley/Wellner): a pixel goes black
+ * if it is darker than the mean of its (t%) neighborhood. Good for photos
+ * with shadows or uneven lighting.
  */
+export function adaptiveThreshold(source: HTMLCanvasElement, windowRadius = 24, t = 0.15): HTMLCanvasElement {
+  const w = source.width;
+  const h = source.height;
+  const out = document.createElement('canvas');
+  out.width = w;
+  out.height = h;
+  const srcCtx = source.getContext('2d', { willReadFrequently: true });
+  const dstCtx = out.getContext('2d', { willReadFrequently: true });
+  if (!srcCtx || !dstCtx) return out;
+
+  const img = srcCtx.getImageData(0, 0, w, h);
+  const data = img.data;
+  const gray = new Float64Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    gray[i] = 0.299 * data[i * 4] + 0.587 * data[i * 4 + 1] + 0.114 * data[i * 4 + 2];
+  }
+
+  // Integral image for O(1) window means.
+  const integral = new Float64Array((w + 1) * (h + 1));
+  for (let y = 0; y < h; y++) {
+    let rowSum = 0;
+    for (let x = 0; x < w; x++) {
+      rowSum += gray[y * w + x];
+      integral[(y + 1) * (w + 1) + (x + 1)] = integral[y * (w + 1) + (x + 1)] + rowSum;
+    }
+  }
+
+  for (let y = 0; y < h; y++) {
+    const y0 = Math.max(0, y - windowRadius);
+    const y1 = Math.min(h - 1, y + windowRadius);
+    for (let x = 0; x < w; x++) {
+      const x0 = Math.max(0, x - windowRadius);
+      const x1 = Math.min(w - 1, x + windowRadius);
+      const area = (x1 - x0 + 1) * (y1 - y0 + 1);
+      const sum =
+        integral[(y1 + 1) * (w + 1) + (x1 + 1)] -
+        integral[y0 * (w + 1) + (x1 + 1)] -
+        integral[(y1 + 1) * (w + 1) + x0] +
+        integral[y0 * (w + 1) + x0];
+      const i = y * w + x;
+      const v = gray[i] <= sum / area * (1 - t) ? 0 : 255;
+      data[i * 4] = data[i * 4 + 1] = data[i * 4 + 2] = v;
+    }
+  }
+  dstCtx.putImageData(img, 0, 0);
+  return out;
+}
+
+export function rotate90(canvas: HTMLCanvasElement): HTMLCanvasElement {
+  const out = document.createElement('canvas');
+  out.width = canvas.height;
+  out.height = canvas.width;
+  const ctx = out.getContext('2d');
+  if (ctx) {
+    ctx.translate(out.width / 2, out.height / 2);
+    ctx.rotate(Math.PI / 2);
+    ctx.drawImage(canvas, -canvas.width / 2, -canvas.height / 2);
+  }
+  return out;
+}
+
+export function rotate270(canvas: HTMLCanvasElement): HTMLCanvasElement {
+  const out = document.createElement('canvas');
+  out.width = canvas.height;
+  out.height = canvas.width;
+  const ctx = out.getContext('2d');
+  if (ctx) {
+    ctx.translate(out.width / 2, out.height / 2);
+    ctx.rotate(-Math.PI / 2);
+    ctx.drawImage(canvas, -canvas.width / 2, -canvas.height / 2);
+  }
+  return out;
+}
+
+/** Rotate by an arbitrary number of quarter-turns (0-3). */
+export function rotateQuarter(canvas: HTMLCanvasElement, turns: number): HTMLCanvasElement {
+  const t = ((turns % 4) + 4) % 4;
+  if (t === 0) return canvas;
+  if (t === 1) return rotate90(canvas);
+  if (t === 2) {
+    const once = rotate90(canvas);
+    return rotate90(once);
+  }
+  return rotate270(canvas);
+}
+
+export interface Band {
+  index: number;
+  canvas: HTMLCanvasElement;
+  y0: number;
+  y1: number;
+  overlapPx: number;
+}
+
+/** Split into horizontal bands with ~15% overlap for top-to-bottom scanning. */
 export function splitIntoBands(image: HTMLCanvasElement, bandCount = 5): Band[] {
   const height = image.height;
   const bandHeight = height / bandCount;
@@ -93,23 +212,31 @@ export function splitIntoBands(image: HTMLCanvasElement, bandCount = 5): Band[] 
     const y1 = Math.min(height, Math.round((i + 1) * bandHeight + (i < bandCount - 1 ? overlapPx : 0)));
     const cropHeight = y1 - y0;
     if (cropHeight < 8) continue;
-
     const crop = document.createElement('canvas');
     crop.width = image.width;
     crop.height = cropHeight;
-    crop
-      .getContext('2d')
-      ?.drawImage(image, 0, y0, image.width, cropHeight, 0, 0, image.width, cropHeight);
+    crop.getContext('2d')?.drawImage(image, 0, y0, image.width, cropHeight, 0, 0, image.width, cropHeight);
     bands.push({ index: bands.length + 1, canvas: crop, y0, y1, overlapPx });
   }
-
   return bands;
 }
 
-/**
- * Estimate blur via variance of the Laplacian (normalized by brightness).
- * Lower = blurrier. ~<0.003 usually means text is unreadable.
- */
+/** Crop a region (in source pixel coords) out of a canvas. */
+export function cropRegion(source: HTMLCanvasElement, bbox: BBox): HTMLCanvasElement {
+  const x = Math.max(0, Math.round(bbox.x0));
+  const y = Math.max(0, Math.round(bbox.y0));
+  const w = Math.min(source.width - x, Math.max(1, Math.round(bbox.x1 - bbox.x0)));
+  const h = Math.min(source.height - y, Math.max(1, Math.round(bbox.y1 - bbox.y0)));
+  const out = document.createElement('canvas');
+  out.width = w;
+  out.height = h;
+  out.getContext('2d')?.drawImage(source, x, y, w, h, 0, 0, w, h);
+  return out;
+}
+
+import type { BBox } from '../types';
+
+/** Estimate blur via variance of the Laplacian. Lower = blurrier. */
 export function estimateBlur(canvas: HTMLCanvasElement): number {
   const small = document.createElement('canvas');
   const w = (small.width = 256);
@@ -130,7 +257,6 @@ export function estimateBlur(canvas: HTMLCanvasElement): number {
   for (let y = 1; y < h - 1; y++) {
     for (let x = 1; x < w - 1; x++) {
       const i = y * w + x;
-      // 4-neighbor Laplacian
       const lap = 4 * gray[i] - gray[i - 1] - gray[i + 1] - gray[i - w] - gray[i + w];
       sum += lap;
       sumSq += lap * lap;
@@ -138,6 +264,5 @@ export function estimateBlur(canvas: HTMLCanvasElement): number {
     }
   }
   if (count === 0) return 0;
-  const variance = sumSq / count - (sum / count) ** 2;
-  return variance;
+  return sumSq / count - (sum / count) ** 2;
 }

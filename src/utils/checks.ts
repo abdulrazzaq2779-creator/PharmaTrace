@@ -1,24 +1,28 @@
-import type { CheckResult, ExtractedData, RiskLevel } from '../types';
+import type { BatchInfoResult, CheckResult, DecodedCode, ExtractedData, RiskLevel } from '../types';
 import { findCatalogEntry } from '../services/extract';
+import { lookupBatchInfo } from '../services/identify';
+import { parseCodePayload } from '../services/barcode';
 import { parseMonthYear } from './helpers';
 
 /**
- * Run all checks against REAL extracted data. Every check states its reason;
- * nothing is inferred beyond what was read from the pack.
+ * Run all checks against the merged session data. Missing/unreadable data is
+ * never a "fail" — it is "review" or "unavailable", and it lowers confidence.
+ * "fail" requires a positive contradiction (e.g. a past expiry date).
  */
 export function runChecks(data: ExtractedData): CheckResult[] {
   const checks: CheckResult[] = [];
   const f = data.fields;
 
+  // --- Package detection: keyword-based; 0-2 hits = review, never fail ----
   if (!data.usable) {
-    return [
-      {
-        id: 'usability',
-        name: 'Medicine Package Detected',
-        status: 'fail',
-        reason: data.rejectReason ?? 'The image does not appear to be a medicine package.',
-      },
-    ];
+    checks.push({
+      id: 'usability',
+      name: 'Package Detection',
+      status: 'review',
+      reason:
+        data.rejectReason ??
+        'Could not read enough text to identify a medicine package. Add a clearer photo or enter details manually.',
+    });
   }
 
   // --- Expiry: fail only if actually past ---------------------------------
@@ -37,15 +41,19 @@ export function runChecks(data: ExtractedData): CheckResult[] {
         id: 'expiry',
         name: 'Expiry Date',
         status: expired ? 'fail' : 'pass',
-        reason: expired ? 'Expired - do not use' : `Valid until end of ${parsed.month}/${parsed.year}.`,
+        reason: expired
+          ? 'Expired - do not use'
+          : f.expiry_date.origin === 'user'
+            ? `Valid until end of ${parsed.month}/${parsed.year} (entered by user).`
+            : `Valid until end of ${parsed.month}/${parsed.year}.`,
       });
     }
   } else {
     checks.push({
       id: 'expiry',
       name: 'Expiry Date',
-      status: 'unavailable',
-      reason: 'No expiry date was readable on the pack.',
+      status: 'review',
+      reason: NOT_VISIBLE_HINT,
     });
   }
 
@@ -55,18 +63,18 @@ export function runChecks(data: ExtractedData): CheckResult[] {
       id: 'batch',
       name: 'Batch Number',
       status: 'pass',
-      reason: `Batch ${f.batch_no.value} was read (${f.batch_no.confidence} confidence).`,
+      reason: `Batch ${f.batch_no.value} ${describeOrigin(f.batch_no)}.`,
     });
   } else {
     checks.push({
       id: 'batch',
       name: 'Batch Number',
       status: 'review',
-      reason: 'Batch number missing or unreadable — verify against the physical pack.',
+      reason: NOT_VISIBLE_HINT,
     });
   }
 
-  // --- Company-product: catalog lookup, fail only on real contradiction ---
+  // --- Manufacturer: unavailable/review when unknown, no catalog guessing -
   const brand = f.brand_name?.value;
   const manufacturer = f.manufacturer_name?.value ?? f.marketer_name?.value;
   if (!brand || !manufacturer) {
@@ -95,26 +103,17 @@ export function runChecks(data: ExtractedData): CheckResult[] {
           reason: `"${brand}" is not listed under ${entry.manufacturer} in reference data — verify with a pharmacist.`,
         });
       } else {
-        // If a composition was read, check for a real contradiction with the catalog.
-        const composition = f.composition?.value ?? '';
-        const compositionContradicts =
-          composition !== '' &&
-          !product.name.toLowerCase().includes(composition.toLowerCase().split(/[\s+/]/)[0].toLowerCase()) &&
-          !composition.toLowerCase().includes(product.name.toLowerCase());
-
         checks.push({
           id: 'company-product',
           name: 'Company-Product Consistency',
-          status: compositionContradicts ? 'review' : 'pass',
-          reason: compositionContradicts
-            ? `Composition "${composition}" does not match reference data for ${product.name}.`
-            : `${entry.manufacturer} lists ${product.name} in reference data.`,
+          status: 'pass',
+          reason: `${entry.manufacturer} lists ${product.name} in reference data.`,
         });
       }
     }
   }
 
-  // --- Visual template check: no template dataset exists -------------------
+  // --- Visual template: no template dataset exists -------------------------
   checks.push({
     id: 'visual-template',
     name: 'Visual Template Match',
@@ -122,14 +121,14 @@ export function runChecks(data: ExtractedData): CheckResult[] {
     reason: 'No packaging template for this product is available to compare against.',
   });
 
-  // --- Text readability: low OCR confidence surfaces as review ------------
+  // --- Text readability ----------------------------------------------------
   const lowConfidenceLines = data.rawTextLines.filter(l => l.confidence === 'low').length;
   if (lowConfidenceLines > 0) {
     checks.push({
       id: 'readability',
       name: 'Text Readability',
       status: 'review',
-      reason: `${lowConfidenceLines} line${lowConfidenceLines === 1 ? '' : 's'} were read with low confidence — rescan in better light for a firmer result.`,
+      reason: `${lowConfidenceLines} line${lowConfidenceLines === 1 ? '' : 's'} were read with low confidence.`,
     });
   } else if (data.rawTextLines.length > 0) {
     checks.push({
@@ -140,7 +139,7 @@ export function runChecks(data: ExtractedData): CheckResult[] {
     });
   }
 
-  // --- Image quality: blur -----------------------------------------------
+  // --- Image quality -------------------------------------------------------
   if (data.blurScore > 0 && data.blurScore < 0.003) {
     checks.push({
       id: 'image-quality',
@@ -150,7 +149,118 @@ export function runChecks(data: ExtractedData): CheckResult[] {
     });
   }
 
+  checks.push(...runCodeChecks(data.fields, data.codes));
+  checks.push(...runBatchInfoCheck(data.fields));
+
   return checks;
+}
+
+/**
+ * Code checks: "Code readable" (pass/unavailable only — no code is never a
+ * fail) and a cross-check of any GS1 batch/expiry against the OCR reads.
+ * A decoded code NEVER proves authenticity on its own.
+ */
+export function runCodeChecks(fields: ExtractedData['fields'], codes: DecodedCode[]): CheckResult[] {
+  const checks: CheckResult[] = [];
+  if (codes.length === 0) {
+    checks.push({
+      id: 'code-readable',
+      name: 'Code Readable',
+      status: 'unavailable',
+      reason: 'No QR, DataMatrix or 1D barcode could be decoded from the image. Not every pack carries one.',
+    });
+    return checks;
+  }
+
+  const primary = codes[0];
+  checks.push({
+    id: 'code-readable',
+    name: 'Code Readable',
+    status: 'pass',
+    reason: `${primary.format} code decoded${codes.length > 1 ? ` (+${codes.length - 1} more)` : ''}. A readable code does NOT prove authenticity — copied codes exist.`,
+  });
+
+  // Cross-check any batch/expiry inside a GS1 payload against the OCR text.
+  const gs1 = codes
+    .map(c => parseCodePayload(c.payload))
+    .find(p => p.kind === 'gs1');
+  if (!gs1) return checks;
+
+  const ocrBatch = fields.batch_no?.value;
+  if (gs1.batch && ocrBatch) {
+    const match = ocrBatch.replace(/[^A-Za-z0-9]/g, '').toUpperCase() === gs1.batch.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+    checks.push({
+      id: 'code-batch-match',
+      name: 'Code vs Printed Batch',
+      status: match ? 'pass' : 'fail',
+      reason: match
+        ? `Batch on the pack (${ocrBatch}) matches the code.`
+        : 'Printed batch differs from the code.',
+    });
+  }
+  const ocrExpiry = fields.expiry_date?.value;
+  if (gs1.expiry && ocrExpiry) {
+    const parsedOcr = parseMonthYear(ocrExpiry);
+    const match =
+      parsedOcr !== null &&
+      parsedOcr.month === Number(gs1.expiry.slice(0, 2)) &&
+      parsedOcr.year === Number(gs1.expiry.slice(3, 7));
+    checks.push({
+      id: 'code-expiry-match',
+      name: 'Code vs Printed Expiry',
+      status: match ? 'pass' : 'fail',
+      reason: match
+        ? `Expiry on the pack (${ocrExpiry}) matches the code.`
+        : 'Printed expiry differs from the code.',
+    });
+  }
+  return checks;
+}
+
+/**
+ * Batch information panel as checks: reference lookup + pattern format check.
+ * Never infers a medicine type or category from the batch number.
+ */
+export function runBatchInfoCheck(fields: ExtractedData['fields']): CheckResult[] {
+  const batchField = fields.batch_no;
+  if (!batchField) return [];
+  const info: BatchInfoResult = lookupBatchInfo(batchField.value, fields.manufacturer_name?.value ?? fields.marketer_name?.value);
+
+  const checks: CheckResult[] = [];
+  if (info.reference) {
+    const r = info.reference;
+    checks.push({
+      id: 'batch-reference',
+      name: 'Batch Reference Data',
+      status: 'pass',
+      reason: `Batch ${r.batch} of ${r.product} (${r.manufacturer}) is in reference data${r.mfg ? `, mfg ${r.mfg}` : ''}${r.exp ? `, exp ${r.exp}` : ''}${r.source ? `, source: ${r.source}` : ''}.`,
+    });
+  } else {
+    checks.push({
+      id: 'batch-reference',
+      name: 'Batch Reference Data',
+      status: 'unavailable',
+      reason: `Batch ${batchField.value} not in reference data. Cannot be verified.`,
+    });
+  }
+
+  if (info.formatCheck) {
+    checks.push({
+      id: 'batch-format',
+      name: 'Batch Format',
+      status: info.formatCheck.status === 'pass' ? 'pass' : info.formatCheck.status === 'fail' ? 'review' : 'unavailable',
+      reason: info.formatCheck.detail,
+    });
+  }
+  return checks;
+}
+
+const NOT_VISIBLE_HINT =
+  'Not visible in this image. Batch and expiry are usually printed on the crimped edge or the outer carton. Photograph that area.';
+
+function describeOrigin(field: { origin: 'image' | 'user'; confidence: string }): string {
+  if (field.origin === 'user') return 'was entered by user';
+  return `was read from the image (${field.confidence} confidence)`;
 }
 
 /** A month is expired if the last day of that month is before today. */
@@ -160,9 +270,8 @@ export function isPastMonth(parsed: { month: number; year: number }): boolean {
 }
 
 /**
- * Overall risk derived ONLY from check results:
- * high-risk requires 2+ independent fails; any single fail or review yields
- * needs-review; consistent otherwise. This is never a genuineness guarantee.
+ * Overall result from check counts only: high-risk needs 2+ independent fails.
+ * Missing data (review/unavailable) yields needs-review, never fail.
  */
 export function computeOverall(checks: CheckResult[]): RiskLevel {
   const fails = checks.filter(c => c.status === 'fail').length;
@@ -181,11 +290,18 @@ export function countStatuses(checks: CheckResult[]) {
   };
 }
 
-/** 0-100 quality score from real signals: blur, line count, confidence mix. */
-export function computeScanQuality(data: ExtractedData): number {
-  const blurFactor = Math.min(1, data.blurScore / 0.02); // saturate at healthy variance
+/** 0-100 evidence strength: reads + user entries + skips, from real signals. */
+export function computeScanQuality(
+  data: ExtractedData,
+  skippedCount = 0,
+  userEnteredCount = 0
+): number {
+  const blurFactor = Math.min(1, data.blurScore / 0.02);
   const lineFactor = Math.min(1, data.rawTextLines.length / 12);
   const highConf = data.rawTextLines.filter(l => l.confidence === 'high').length;
   const confFactor = data.rawTextLines.length > 0 ? highConf / data.rawTextLines.length : 0;
-  return Math.round(100 * (0.4 * blurFactor + 0.3 * lineFactor + 0.3 * confFactor));
+  const skipPenalty = Math.min(0.3, skippedCount * 0.1);
+  const userBonus = Math.min(0.15, userEnteredCount * 0.05);
+  const base = 0.4 * blurFactor + 0.3 * lineFactor + 0.3 * confFactor;
+  return Math.max(0, Math.round(100 * (base - skipPenalty + userBonus)));
 }

@@ -1,4 +1,4 @@
-import type { AppSettings, ScanHistoryItem, ScanResult } from '../types';
+import type { AppSettings, ScanResult } from '../types';
 import { defaultSettings } from '../types';
 
 const SCAN_RESULTS_KEY = 'pharmatrace-scan-results';
@@ -40,18 +40,30 @@ function writeJson(key: string, value: unknown): void {
   }
 }
 
-/** Defensive load: skip entries that do not have the expected shape. */
+/** Defensive load: skip malformed entries and backfill fields added later. */
 export function loadScanResults(): ScanResult[] {
   const raw = readJson<ScanResult[]>(SCAN_RESULTS_KEY);
   if (!Array.isArray(raw)) return [];
-  return raw.filter(
-    (item): item is ScanResult =>
-      typeof item?.id === 'string' &&
-      typeof item?.timestamp === 'string' &&
-      typeof item?.imageUrl === 'string' &&
-      Array.isArray(item?.checks) &&
-      typeof item?.extractedData === 'object'
-  );
+  return raw
+    .filter(
+      (item): item is ScanResult =>
+        typeof item?.id === 'string' &&
+        typeof item?.timestamp === 'string' &&
+        typeof item?.imageUrl === 'string' &&
+        Array.isArray(item?.checks) &&
+        typeof item?.extractedData === 'object'
+    )
+    .map(item => ({
+      ...item,
+      photos: Array.isArray(item.photos) ? item.photos : [],
+      skippedFields: Array.isArray(item.skippedFields) ? item.skippedFields : [],
+      userEnteredFields: Array.isArray(item.userEnteredFields) ? item.userEnteredFields : [],
+      // Fields added after the first release — absent in older saved scans.
+      identification: item.identification ?? null,
+      drugClass: item.drugClass ?? null,
+      batchInfo: item.batchInfo ?? null,
+      extractedData: { ...item.extractedData, codes: item.extractedData.codes ?? [] },
+    }));
 }
 
 export function saveScanResults(results: ScanResult[]): void {
@@ -66,19 +78,4 @@ export function saveSettings(settings: AppSettings): void {
   writeJson(SETTINGS_KEY, settings);
 }
 
-/** Derive the history list item from a full scan result (no fake names). */
-export function toHistoryItem(scan: ScanResult): ScanHistoryItem {
-  const f = scan.extractedData.fields;
-  const name = f.brand_name?.value ?? f.composition?.value ?? 'Unidentified pack';
-  return {
-    id: scan.id,
-    date: scan.timestamp,
-    productName: name,
-    riskLevel: scan.riskLevel,
-    thumbnail: scan.imageUrl,
-  };
-}
 
-export function historyFromResults(results: ScanResult[]): ScanHistoryItem[] {
-  return results.map(toHistoryItem);
-}

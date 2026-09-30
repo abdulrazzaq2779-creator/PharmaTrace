@@ -1,87 +1,123 @@
-import { createWorker } from 'tesseract.js';
-import type { CaptureSource, ExtractedData, ExtractionField, ScanResult, TextLine } from '../types';
+import { createWorker, type PSM } from 'tesseract.js';
+import type { BBox, CaptureSource, DecodedCode, ExtractedData, ExtractionField, FieldKey, ScanResult, SessionPhoto, TextLine } from '../types';
 import {
+  adaptiveThreshold,
   canvasToJpeg,
+  cropRegion,
   decodeImage,
   estimateBlur,
+  grayscaleNormalized,
   makeThumbnail,
-  rotate90,
+  rotateQuarter,
   splitIntoBands,
-  type Band,
+  upscaleForOcr,
 } from '../utils/image';
 import { extractFields } from './extract';
+import { decodeCodes } from './barcode';
 import { computeOverall, computeScanQuality, runChecks } from '../utils/checks';
 import { generateId } from '../utils/helpers';
 
 export interface ScanProgress {
-  phase: 'preparing' | 'bands' | 'rotated' | 'full-pass' | 'merging' | 'extracting' | 'done';
-  bandIndex: number;
-  totalBands: number;
-  /** 0-100 position of the scan line over the image (real progress, not a timer). */
-  scanLinePct: number;
-  /** 1-based indexes of bands whose results are already merged (for tinting). */
-  completedBands: number[];
+  phase: 'preparing' | 'variants' | 'bands' | 'merging' | 'extracting' | 'done';
+  /** Human-readable current activity, shown in the live feed. */
   message: string;
+  /** 0-100 scan-line position (real progress, not a timer). */
+  scanLinePct: number;
+  /** Completed OCR run labels, e.g. "gray·0°·psm6". */
+  completedRuns: string[];
+  totalRuns: number;
+  /** New lines found by the most recent run (for the feed). */
+  lastRunLines: string[];
 }
 
 export class ScanError extends Error {}
 
-const TESSERACT_HIGH = 85;
-const TESSERACT_MEDIUM = 60;
+const HIGH_CONF = 85;
+const MEDIUM_CONF = 60;
+const MIN_WORD_CONF = 60;
+const MIN_ALNUM_RATIO = 0.4;
+const ROTATIONS = [0, 1, 3] as const; // quarter-turns: 0°, 90°, 270°
+const PSMS: Array<{ mode: number; label: string }> = [
+  { mode: 6, label: 'psm6' },
+  { mode: 11, label: 'psm11' },
+];
 
 function confidenceFromTesseract(value: number): TextLine['confidence'] {
-  if (value >= TESSERACT_HIGH) return 'high';
-  if (value >= TESSERACT_MEDIUM) return 'medium';
+  if (value >= HIGH_CONF) return 'high';
+  if (value >= MEDIUM_CONF) return 'medium';
   return 'low';
 }
 
-/** Extract text lines from any tesseract.js recognize() result shape. */
-function linesFromTesseract(data: {
-  lines?: unknown[];
-  blocks?: unknown[];
-  text?: string;
-}): Array<{ text: string; bbox: { x0: number; y0: number; x1: number; y1: number }; confidence: number }> {
-  const out: Array<{ text: string; bbox: { x0: number; y0: number; x1: number; y1: number }; confidence: number }> = [];
+interface RawLine {
+  text: string;
+  bbox: BBox;
+  confidence: number;
+}
 
-  if (Array.isArray(data.lines)) {
-    for (const line of data.lines as Array<{ text?: string; confidence?: number; bbox?: Record<string, number> }>) {
-      if (!line?.text?.trim()) continue;
-      const b = line.bbox ?? { x0: 0, y0: 0, x1: 0, y1: 0 };
-      out.push({ text: line.text, confidence: line.confidence ?? 0, bbox: { x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1 } });
-    }
-    return out;
-  }
+/** Extract text lines with geometry from a tesseract.js v7+ recognize result. */
+export function linesFromTesseract(data: unknown): RawLine[] {
+  const page = data as {
+    lines?: unknown[] | null;
+    blocks?: Array<{ paragraphs?: Array<{ lines?: Array<{ text?: string; confidence?: number; bbox?: Record<string, number> }> }> }> | null;
+    text?: string;
+  };
 
-  if (Array.isArray(data.blocks)) {
-    for (const block of data.blocks as Array<{ paragraphs?: Array<{ lines?: unknown[] }> }>) {
-      for (const paragraph of block.paragraphs ?? []) {
-        for (const line of (paragraph.lines ?? []) as Array<{ text?: string; confidence?: number; bbox?: Record<string, number> }>) {
+  const out: RawLine[] = [];
+
+  if (Array.isArray(page.blocks)) {
+    for (const block of page.blocks) {
+      for (const paragraph of block?.paragraphs ?? []) {
+        for (const line of paragraph?.lines ?? []) {
           if (!line?.text?.trim()) continue;
           const b = line.bbox ?? { x0: 0, y0: 0, x1: 0, y1: 0 };
-          out.push({ text: line.text, confidence: line.confidence ?? 0, bbox: { x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1 } });
+          out.push({
+            text: line.text,
+            confidence: line.confidence ?? 0,
+            bbox: { x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1 },
+          });
         }
       }
     }
     if (out.length > 0) return out;
   }
 
-  // Last resort: whole text without geometry.
-  for (const text of (data.text ?? '').split('\n')) {
-    if (!text.trim()) continue;
-    out.push({ text, confidence: TESSERACT_MEDIUM, bbox: { x0: 0, y0: 0, x1: 0, y1: 0 } });
+  for (const lineText of (page.text ?? '').split('\n')) {
+    if (!lineText.trim()) continue;
+    out.push({ text: lineText, confidence: MEDIUM_CONF, bbox: { x0: 0, y0: 0, x1: 0, y1: 0 } });
   }
   return out;
 }
 
+/** Drop junk: low word-confidence or mostly-symbol lines. */
+function passesQualityFilter(line: RawLine): boolean {
+  if (line.confidence < MIN_WORD_CONF) return false;
+  const chars = line.text.replace(/\s/g, '');
+  if (chars.length === 0) return false;
+  const alnum = chars.replace(/[^a-zA-Z0-9.,:/+\-₹]/g, '').length;
+  return alnum / chars.length >= MIN_ALNUM_RATIO;
+}
+
+/** Map a bbox from a rotated canvas back to original coordinates. */
+function mapRotatedBoxToOriginal(bbox: BBox, rotationTurns: number, canvasW: number, canvasH: number): BBox {
+  // rotation 1 (90° cw): (x,y) -> (H - y, x). rotation 3 (270° cw): (x,y) -> (y, W - x)
+  if (rotationTurns === 1) {
+    return { x0: canvasH - bbox.y1, y0: bbox.x0, x1: canvasH - bbox.y0, y1: bbox.x1 };
+  }
+  if (rotationTurns === 3) {
+    return { x0: bbox.y0, y0: canvasW - bbox.x1, x1: bbox.y1, y1: canvasW - bbox.x0 };
+  }
+  return bbox;
+}
+
 // ---------------------------------------------------------------------------
-// Merging: dedupe overlapping reads across bands/orientations, keep order.
+// Merging
 // ---------------------------------------------------------------------------
 
 function normalizeForCompare(text: string): string {
   return text.toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
-function iou(a: TextLine['bbox'], b: TextLine['bbox']): number {
+function iou(a: BBox, b: BBox): number {
   const x0 = Math.max(a.x0, b.x0);
   const y0 = Math.max(a.y0, b.y0);
   const x1 = Math.min(a.x1, b.x1);
@@ -93,18 +129,9 @@ function iou(a: TextLine['bbox'], b: TextLine['bbox']): number {
   return union > 0 ? inter / union : 0;
 }
 
-function isDuplicate(a: TextLine, b: TextLine): boolean {
-  if ((a.orientation ?? 0) !== (b.orientation ?? 0)) return false;
-  const na = normalizeForCompare(a.text);
-  const nb = normalizeForCompare(b.text);
-  if (!na || !nb) return false;
-  const sameText = na === nb || (na.length >= 6 && nb.length >= 6 && (na.includes(nb) || nb.includes(na)));
-  return sameText && iou(a.bbox, b.bbox) > 0.25;
-}
+const CONF_RANK = { high: 3, medium: 2, low: 1 } as const;
 
-const CONFIDENCE_RANK = { high: 3, medium: 2, low: 1 } as const;
-
-/** Merge band + orientation passes into deduplicated reading order. */
+/** Dedupe overlapping reads across runs; keep the best text per region. */
 export function mergeLines(passes: TextLine[][]): TextLine[] {
   const merged: TextLine[] = [];
   for (const pass of passes) {
@@ -114,34 +141,23 @@ export function mergeLines(passes: TextLine[][]): TextLine[] {
         merged.push({ ...line });
         continue;
       }
-      // Keep the better read; remember that another pass also saw it.
-      if (CONFIDENCE_RANK[line.confidence] > CONFIDENCE_RANK[existing.confidence]) {
+      if (CONF_RANK[line.confidence] > CONF_RANK[existing.confidence]) {
         existing.text = line.text;
         existing.confidence = line.confidence;
+        existing.wordConfidence = Math.max(existing.wordConfidence ?? 0, line.wordConfidence ?? 0);
       }
-      existing.fields = [...new Set([...(existing.fields ?? []), ...(line.fields ?? [])])];
     }
   }
-  return merged.sort((a, b) => {
-    const orientA = a.orientation ?? 0;
-    const orientB = b.orientation ?? 0;
-    if (orientA !== orientB) return orientA - orientB;
-    if (Math.abs(a.bbox.y0 - b.bbox.y0) > 12) return a.bbox.y0 - b.bbox.y0;
-    return a.bbox.x0 - b.bbox.x0;
-  });
+  return merged;
 }
 
-/** Map a bbox from the rotate90()-ed image back to original coordinates. */
-function mapRotatedBoxToOriginal(
-  bbox: { x0: number; y0: number; x1: number; y1: number },
-  originalHeight: number
-): TextLine['bbox'] {
-  return {
-    x0: bbox.y0,
-    y0: originalHeight - bbox.x1,
-    x1: bbox.y1,
-    y1: originalHeight - bbox.x0,
-  };
+function isDuplicate(a: TextLine, b: TextLine): boolean {
+  if ((a.orientation ?? 0) !== (b.orientation ?? 0)) return false;
+  const na = normalizeForCompare(a.text);
+  const nb = normalizeForCompare(b.text);
+  if (!na || !nb) return false;
+  const sameText = na === nb || (na.length >= 6 && nb.length >= 6 && (na.includes(nb) || nb.includes(na)));
+  return sameText && iou(a.bbox, b.bbox) > 0.2;
 }
 
 // ---------------------------------------------------------------------------
@@ -151,15 +167,14 @@ function mapRotatedBoxToOriginal(
 interface VisionResponse {
   usable: boolean;
   reject_reason?: string;
-  fields?: Partial<Record<keyof ExtractedData['fields'], { value: string; confidence: 'high' | 'medium' | 'low' } | null>>;
-  text_lines?: Array<{ text: string; bbox: { x0: number; y0: number; x1: number; y1: number }; confidence: number }>;
-  unreadable_regions?: Array<{ bbox: TextLine['bbox']; reason: string }>;
+  fields?: Partial<Record<FieldKey, { value: string; confidence: 'high' | 'medium' | 'low' } | null>>;
+  text_lines?: Array<{ text: string; bbox: BBox; confidence: number }>;
+  unreadable_regions?: Array<{ bbox: BBox; reason: string }>;
 }
 
 /**
- * Ask the backend to analyze the image with a vision model.
- * Returns null only when the backend has no API key (501) — the caller then
- * falls back to on-device Tesseract. Any other failure throws.
+ * Ask the backend to analyze with a vision model.
+ * Returns null only on 501 (no server API key) → caller falls back to Tesseract.
  */
 export async function analyzeWithVisionModel(dataUrl: string): Promise<VisionResponse | null> {
   console.log('sending to analyzer', '/api/scan', `${Math.round(dataUrl.length / 1024)} KB base64`);
@@ -175,7 +190,7 @@ export async function analyzeWithVisionModel(dataUrl: string): Promise<VisionRes
   }
 
   if (response.status === 501) {
-    console.log('analyzer unavailable (no server API key) — falling back to on-device OCR');
+    console.log('analyzer unavailable (no server API key) — using on-device OCR');
     return null;
   }
   if (!response.ok) {
@@ -187,225 +202,326 @@ export async function analyzeWithVisionModel(dataUrl: string): Promise<VisionRes
   return payload;
 }
 
-function fieldsFromVision(vision: VisionResponse): ExtractedData['fields'] {
-  const fields = emptyFields();
-  if (!vision.fields) return fields;
-  for (const key of Object.keys(fields) as Array<keyof ExtractedData['fields']>) {
-    const value = vision.fields[key];
-    if (value && typeof value.value === 'string' && value.value.trim() !== '') {
-      fields[key] = {
-        value: value.value.trim(),
-        confidence: value.confidence ?? 'low',
-        sourceLines: 0,
-      };
+// ---------------------------------------------------------------------------
+// On-device OCR grid
+// ---------------------------------------------------------------------------
+
+interface OcrRun {
+  label: string;
+  lines: RawLine[];
+  /** Mean word confidence of the run. */
+  meanConfidence: number;
+  /** Distinct medicine keywords found (for run scoring). */
+  keywordHits: number;
+  orientation: 0 | 1 | 2;
+}
+
+async function recognizeAll(
+  worker: Awaited<ReturnType<typeof createWorker>>,
+  variants: Array<{ label: string; canvas: HTMLCanvasElement }>,
+  onProgress: (p: ScanProgress) => void,
+  totalRuns: number,
+  completed: string[]
+): Promise<OcrRun[]> {
+  const runs: OcrRun[] = [];
+  for (const variant of variants) {
+    for (const turns of ROTATIONS) {
+      const oriented = rotateQuarter(variant.canvas, turns);
+      for (const psm of PSMS) {
+        const label = `${variant.label}·${turns * 90}°·${psm.label}`;
+        await worker.setParameters({ tessedit_pageseg_mode: psm.mode as unknown as PSM });
+        const result = await worker.recognize(oriented, {}, { blocks: true });
+        const lines = linesFromTesseract(result.data).filter(passesQualityFilter);
+        const meanConfidence =
+          lines.length > 0 ? lines.reduce((s, l) => s + l.confidence, 0) / lines.length : 0;
+        runs.push({
+          label,
+          lines,
+          meanConfidence,
+          keywordHits: countKeywords(lines.map(l => l.text).join('\n')),
+          orientation: (turns === 0 ? 0 : turns === 1 ? 1 : 2) as 0 | 1 | 2,
+        });
+        completed.push(label);
+        onProgress({
+          phase: 'variants',
+          message: `Read ${label}: ${lines.length} lines`,
+          scanLinePct: (completed.length / totalRuns) * 100,
+          completedRuns: [...completed],
+          totalRuns,
+          lastRunLines: lines.slice(0, 4).map(l => l.text.trim()),
+        });
+        console.log(`raw analyzer response (${label})`, lines.length, 'lines, mean conf', Math.round(meanConfidence));
+      }
     }
   }
-  return fields;
+  return runs;
+}
+
+function countKeywords(text: string): number {
+  const patterns = [
+    /\btablets?\b/i, /\bcapsules?\b/i, /\bmg\b|\bmcg\b/i, /\bI\.?P\.?\b|\bUSP\b/i,
+    /\bRx\b/i, /\bschedule\b/i, /\bmanufactured\b|\bmfd\b|\bmfg\b/i, /\bmarketed\b/i,
+    /\bbatch\b|\bb\.?\s*no\b|\blot\b/i, /\bexp\b|\bexpiry\b/i, /\bm\.?r\.?p\b/i, /\bcomposition\b/i,
+  ];
+  return patterns.reduce((count, re) => (re.test(text) ? count + 1 : count), 0);
+}
+
+/** Convert runs to positioned TextLines (bbox mapped back to original space). */
+function runsToTextLines(
+  runs: OcrRun[],
+  variantSizes: Record<string, { w: number; h: number }>,
+  baseSize: { w: number; h: number }
+): TextLine[][] {
+  return runs.map(run => {
+    const [variantLabel, rotationLabel] = run.label.split('·');
+    const turns = parseInt(rotationLabel, 10) / 90;
+    const size = variantSizes[variantLabel] ?? baseSize;
+    return run.lines.map(line => ({
+      text: line.text,
+      bbox: mapRotatedBoxToOriginal(line.bbox, turns, size.w, size.h),
+      band: 0,
+      confidence: confidenceFromTesseract(line.confidence),
+      wordConfidence: line.confidence,
+      runLabel: run.label,
+      orientation: run.orientation,
+    }));
+  });
 }
 
 // ---------------------------------------------------------------------------
 // Pipeline entry
 // ---------------------------------------------------------------------------
 
+export interface ScanInput {
+  file: Blob;
+  source: CaptureSource;
+  /** Present when re-scanning a crop of a previous photo. */
+  crop?: BBox;
+  photoLabel: string;
+}
+
 export async function runScan(
-  file: File,
-  source: CaptureSource,
+  input: ScanInput,
   onProgress: (progress: ScanProgress) => void
-): Promise<{ result: ScanResult; raw: unknown }> {
-  console.log('image received', file.name || 'camera-capture.jpg', file.size, file.type);
+): Promise<{
+  result: Omit<ScanResult, 'photos' | 'skippedFields' | 'userEnteredFields' | 'identification' | 'drugClass' | 'batchInfo'>;
+  raw: unknown;
+}> {
+  console.log('image received', input.photoLabel, input.file.size, input.file.type);
 
-  // 1. Decode + downscale (longest edge ~1600px, text stays legible).
-  onProgress(progress('preparing', 0, 0, [], 0, 'Preparing image…'));
-  const image = await decodeImage(file);
-  const thumbnail = makeThumbnail(image.canvas);
-  const blurScore = estimateBlur(image.canvas);
-  console.log('image decoded', image.width, 'x', image.height, 'blur score', blurScore.toFixed(4));
+  onProgress(progressFor('preparing', 'Preparing image…', 0, [], 0, []));
+  const decoded = await decodeImage(input.file);
+  const sourceCanvas = input.crop ? cropRegion(decoded.canvas, input.crop) : decoded.canvas;
+  const thumbnail = makeThumbnail(sourceCanvas);
+  const blurScore = estimateBlur(sourceCanvas);
+  console.log('image decoded', sourceCanvas.width, 'x', sourceCanvas.height, 'blur', blurScore.toFixed(4));
 
-  // 2. Try the vision-model backend first.
-  const jpeg = canvasToJpeg(image.canvas);
+  // QR / DataMatrix / 1D codes decode on the original color image so both
+  // analyzer paths (vision model + on-device OCR) get them.
+  let codes: DecodedCode[] = [];
   try {
-    const vision = await analyzeWithVisionModel(jpeg);
+    codes = await decodeCodes(sourceCanvas);
+    if (codes.length > 0) {
+      console.log('codes decoded:', codes.map(c => `${c.format} "${c.payload.slice(0, 40)}"`).join(' | '));
+    }
+  } catch (err) {
+    console.error('code decoding failed (non-fatal)', err);
+  }
+
+  const width = sourceCanvas.width;
+  const height = sourceCanvas.height;
+
+  // Try the vision-model backend first.
+  try {
+    const vision = await analyzeWithVisionModel(canvasToJpeg(sourceCanvas));
     if (vision) {
-      onProgress(progress('extracting', 0, 0, [], 100, 'Building result…'));
-      const data = dataFromVision(vision, blurScore);
-      return { result: buildResult(data, image, thumbnail, source, 'vision-model'), raw: vision };
+      onProgress(progressFor('extracting', 'Building result…', 100, [], 100, []));
+      const data = dataFromVision(vision, blurScore, codes);
+      return {
+        result: buildResult(data, thumbnail, input.source, 'vision-model', width, height),
+        raw: vision,
+      };
     }
   } catch (error) {
     if (error instanceof ScanError) throw error;
     throw new ScanError('Could not analyze image.');
   }
 
-  // 3. On-device Tesseract fallback: full pass + bands + rotated pass.
-  const raw = await runTesseractScan(image.canvas, onProgress);
-  onProgress(progress('merging', 0, 0, allBands(raw.totalBands), 100, 'Merging reads…'));
-  const merged = mergeLines([raw.fullPassLines, ...raw.bandLines, raw.rotatedLines]);
-  console.log('merged lines', merged.length, 'from', raw.bandLines.length, 'bands + rotated pass');
-
-  onProgress(progress('extracting', 0, 0, allBands(raw.totalBands), 100, 'Extracting fields…'));
-  const data = extractFields(merged, blurScore);
-
-  // Barcode/QR: a long digit run in the full-image pass is a real barcode signal.
-  if (!data.fields.qr_or_barcode_present) {
-    const barcode = raw.fullPassLines.find(line => /\d{8,}/.test(line.text));
-    if (barcode) {
-      data.fields.qr_or_barcode_present = { value: 'Barcode digits detected', confidence: 'medium', sourceLines: 1 };
-    }
-  }
-
-  return { result: buildResult(data, image, thumbnail, source, 'tesseract'), raw: merged };
-}
-
-interface TesseractScanOutput {
-  fullPassLines: TextLine[];
-  bandLines: TextLine[][];
-  rotatedLines: TextLine[];
-  totalBands: number;
-}
-
-async function runTesseractScan(
-  canvas: HTMLCanvasElement,
-  onProgress: (progress: ScanProgress) => void
-): Promise<TesseractScanOutput> {
+  // On-device OCR grid: 2 variants × 3 rotations × 2 PSMs = 12 runs.
   const worker = await createWorker('eng');
   try {
-    // Full-image pass: layout, logos, long digit runs (barcodes).
-    onProgress(progress('full-pass', 0, 0, [], 2, 'Reading full image…'));
-    const full = await worker.recognize(canvas);
-    const fullPassLines: TextLine[] = linesFromTesseract(full.data).map(line => ({
-      text: line.text,
-      bbox: line.bbox,
-      band: 0,
-      confidence: confidenceFromTesseract(line.confidence),
-      orientation: 0,
-    }));
-    console.log('raw analyzer response (tesseract full pass)', fullPassLines.length, 'lines');
+    const upscaled = upscaleForOcr(sourceCanvas);
+    const gray = grayscaleNormalized(upscaled);
+    const thresholded = adaptiveThreshold(gray);
 
-    // Top-to-bottom bands with overlap; scan line follows band bottoms.
-    const bands = splitIntoBands(canvas, 5);
+    const variants = [
+      { label: 'gray', canvas: gray },
+      { label: 'thresh', canvas: thresholded },
+    ];
+    const variantSizes: Record<string, { w: number; h: number }> = {};
+    for (const variant of variants) {
+      variantSizes[variant.label] = { w: variant.canvas.width, h: variant.canvas.height };
+    }
+
+    const totalRuns = variants.length * ROTATIONS.length * PSMS.length;
+    const completed: string[] = [];
+
+    // Bands over the grayscale variant drive the top-to-bottom scan line.
+    const bands = splitIntoBands(gray, 5);
+
+    const runs = await recognizeAll(worker, variants, onProgress, totalRuns, completed);
+
+    // Band passes on the best upright variant for the scan-line narrative.
     const bandLines: TextLine[][] = [];
-    const completedBands: number[] = [];
     for (const band of bands) {
-      onProgress(
-        progress('bands', band.index, bands.length, [...completedBands], (band.y0 / canvas.height) * 100,
-          `Band ${band.index}/${bands.length}: reading…`)
-      );
-      const result = await worker.recognize(band.canvas);
-      const lines = linesFromTesseract(result.data)
-        .filter(line => line.text.trim().length > 0)
+      const bandResult = await worker.recognize(band.canvas, {}, { blocks: true });
+      const bandRun = linesFromTesseract(bandResult.data)
+        .filter(passesQualityFilter)
         .map(line => ({
           text: line.text,
-          bbox: {
-            x0: line.bbox.x0,
-            y0: line.bbox.y0 + band.y0,
-            x1: line.bbox.x1,
-            y1: line.bbox.y1 + band.y0,
-          },
-          confidence: confidenceFromTesseract(line.confidence),
+          bbox: { ...line.bbox, y0: line.bbox.y0 + band.y0, y1: line.bbox.y1 + band.y0 } as BBox,
+          confidence: line.confidence,
         }));
-      console.log(`band ${band.index}/${bands.length} found`, lines.map(l => l.text.trim()).filter(Boolean));
       bandLines.push(
-        lines.map(line => ({ ...line, band: band.index, orientation: 0 as const }))
+        bandRun.map(line => ({
+          text: line.text,
+          bbox: line.bbox,
+          band: band.index,
+          confidence: confidenceFromTesseract(line.confidence),
+          wordConfidence: line.confidence,
+          runLabel: `band${band.index}`,
+          orientation: 0 as const,
+        }))
       );
-      completedBands.push(band.index);
+      const pct = (band.y1 / gray.height) * 90;
       onProgress(
-        progress('bands', band.index, bands.length, [...completedBands], (band.y1 / canvas.height) * 100,
-          `Band ${band.index}/${bands.length}: found ${lines.length} line${lines.length === 1 ? '' : 's'}`)
+        progressFor(
+          'bands',
+          `Band ${band.index}/${bands.length}: ${bandRun.length} lines`,
+          pct,
+          completed,
+          totalRuns,
+          bandRun.slice(0, 4).map(l => l.text.trim())
+        )
       );
     }
 
-    // Rotated pass: blister strips often print batch/expiry sideways.
-    onProgress(progress('rotated', 0, 0, [...completedBands], 50, 'Checking rotated orientation…'));
-    const rotated = rotate90(canvas);
-    const rotatedResult = await worker.recognize(rotated);
-    const rotatedLines: TextLine[] = linesFromTesseract(rotatedResult.data)
-      .filter(line => line.text.trim().length > 0)
-      .map(line => ({
-        text: line.text,
-        bbox: mapRotatedBoxToOriginal(line.bbox, canvas.height),
-        band: 0,
-        confidence: confidenceFromTesseract(line.confidence),
-        orientation: 1 as const,
-      }));
-    console.log('raw analyzer response (tesseract rotated pass)', rotatedLines.length, 'lines');
+    onProgress(progressFor('merging', 'Merging reads…', 95, completed, totalRuns, []));
+    const allPasses = runsToTextLines(runs, variantSizes, { w: width, h: height });
+    const merged = mergeLines([...allPasses, ...bandLines]);
+    console.log('merged lines', merged.length, 'from', allPasses.length + bandLines.length, 'passes');
 
-    return { fullPassLines, bandLines, rotatedLines, totalBands: bands.length };
+    // Pick the best orientation's lines for field extraction:
+    // keep lines from ALL orientations but let extraction run on the union.
+    onProgress(progressFor('extracting', 'Extracting fields…', 99, completed, totalRuns, []));
+    const data = extractFields(merged, blurScore, codes);
+
+    if (!data.fields.qr_or_barcode_present) {
+      const barcode = merged.find(line => /\d{8,}/.test(line.text));
+      if (barcode) {
+        data.fields.qr_or_barcode_present = {
+          value: 'Barcode digits detected',
+          confidence: 'medium',
+          origin: 'image',
+          provenance: { bbox: barcode.bbox, matchedText: barcode.text.trim(), runLabel: barcode.runLabel },
+        };
+      }
+    }
+
+    return {
+      result: buildResult(data, thumbnail, input.source, 'tesseract', width, height),
+      raw: merged,
+    };
   } finally {
     await worker.terminate();
   }
 }
 
-// ---------------------------------------------------------------------------
-// Result assembly
-// ---------------------------------------------------------------------------
-
 function buildResult(
   data: ExtractedData,
-  image: { canvas: HTMLCanvasElement; width: number; height: number },
   thumbnail: string,
   source: CaptureSource,
-  analyzer: ScanResult['analyzer']
-): ScanResult {
+  analyzer: ScanResult['analyzer'],
+  imageWidth: number,
+  imageHeight: number
+): Omit<ScanResult, 'photos' | 'skippedFields' | 'userEnteredFields' | 'identification' | 'drugClass' | 'batchInfo'> {
   const checks = runChecks(data);
   return {
     id: generateId(),
     timestamp: new Date().toISOString(),
-    imageUrl: thumbnail || canvasToJpeg(image.canvas, 0.6),
+    imageUrl: thumbnail,
     captureSource: source,
     analyzer,
     riskLevel: computeOverall(checks),
     extractedData: data,
     checks,
     scanQuality: computeScanQuality(data),
-    imageWidth: image.width,
-    imageHeight: image.height,
+    imageWidth,
+    imageHeight,
   };
 }
 
-function dataFromVision(vision: VisionResponse, blurScore: number): ExtractedData {
+function dataFromVision(vision: VisionResponse, blurScore: number, codes: DecodedCode[]): ExtractedData {
   const textLines: TextLine[] = (vision.text_lines ?? []).map(line => ({
     text: line.text,
     bbox: line.bbox,
     band: 0,
-    confidence: line.confidence >= TESSERACT_HIGH ? 'high' : line.confidence >= TESSERACT_MEDIUM ? 'medium' : 'low',
+    confidence: line.confidence >= HIGH_CONF ? 'high' : line.confidence >= MEDIUM_CONF ? 'medium' : 'low',
+    wordConfidence: line.confidence,
     orientation: 0,
   }));
-  const data: ExtractedData = {
+  const fields = emptyFields();
+  if (vision.fields) {
+    for (const key of Object.keys(fields) as FieldKey[]) {
+      const value = vision.fields[key];
+      if (value && typeof value.value === 'string' && value.value.trim() !== '') {
+        fields[key] = { value: value.value.trim(), confidence: value.confidence ?? 'low', origin: 'image' };
+      }
+    }
+  }
+  return {
     usable: vision.usable,
     rejectReason: vision.reject_reason,
-    fields: fieldsFromVision(vision),
+    keywordHits: countKeywords(textLines.map(l => l.text).join('\n')),
+    fields,
     rawTextLines: textLines,
-    unreadableRegions: vision.unreadable_regions ?? [],
-    rotatedPassLines: [],
+    unreadableRegions: (vision.unreadable_regions ?? []).map(r => ({
+      bbox: r.bbox,
+      text: r.reason,
+      confidence: 0,
+    })),
     blurScore,
+    codes,
   };
-  return data;
 }
 
-function emptyFields(): ExtractedData['fields'] {
-  const fields: Record<string, ExtractionField | null> = {};
-  for (const key of [
-    'brand_name', 'composition', 'dosage_form', 'manufacturer_name', 'marketer_name',
-    'manufacturing_license_no', 'batch_no', 'mfg_date', 'expiry_date', 'mrp',
-    'schedule_marking', 'qr_or_barcode_present', 'pill_imprint',
-  ]) {
-    fields[key] = null;
-  }
-  return fields as ExtractedData['fields'];
+function emptyFields(): Record<FieldKey, ExtractionField | null> {
+  return {
+    brand_name: null,
+    composition: null,
+    dosage_form: null,
+    manufacturer_name: null,
+    marketer_name: null,
+    manufacturing_license_no: null,
+    batch_no: null,
+    mfg_date: null,
+    expiry_date: null,
+    mrp: null,
+    schedule_marking: null,
+    qr_or_barcode_present: null,
+    pill_imprint: null,
+  };
 }
 
-function progress(
+function progressFor(
   phase: ScanProgress['phase'],
-  bandIndex: number,
-  totalBands: number,
-  completedBands: number[],
+  message: string,
   scanLinePct: number,
-  message: string
+  completedRuns: string[],
+  totalRuns: number,
+  lastRunLines: string[]
 ): ScanProgress {
-  return { phase, bandIndex, totalBands, completedBands, scanLinePct, message };
+  return { phase, message, scanLinePct, completedRuns, totalRuns, lastRunLines };
 }
 
-function allBands(total: number): number[] {
-  return Array.from({ length: total }, (_, i) => i + 1);
-}
-
-export type { Band };
+export type { SessionPhoto };

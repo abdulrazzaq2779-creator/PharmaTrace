@@ -1,22 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { AlertTriangle, Camera, HelpCircle, Info, Shield, Upload, X } from 'lucide-react';
+import { AlertTriangle, Camera, HelpCircle, Info, QrCode, Shield, Upload, X } from 'lucide-react';
 import { Button } from '../components/Button';
 import { Card } from '../components/Card';
 import { Modal } from '../components/Modal';
-import { useCamera, type ScanStage } from '../hooks/useScan';
+import { useCamera } from '../hooks/useScan';
+import { decodeLiveFrame } from '../services/barcode';
 import type { ScanProgress } from '../services/scanPipeline';
 import { disclaimerText, emergencyWarning } from '../data/content';
 import type { CaptureSource } from '../types';
 
 interface ScanScreenProps {
   onScanComplete: (file: File, source: CaptureSource) => void;
-  stage: ScanStage;
+  isAnalyzing: boolean;
   progress: ScanProgress | null;
   scanError: string | null;
   onDismissScanError: () => void;
 }
-
-const BAND_COUNT = 5;
 
 /** Wrap a canvas blob as a File so the pipeline receives real image bytes. */
 async function canvasToFile(canvas: HTMLCanvasElement): Promise<File> {
@@ -27,39 +26,93 @@ async function canvasToFile(canvas: HTMLCanvasElement): Promise<File> {
 
 export function ScanScreen({
   onScanComplete,
-  stage,
+  isAnalyzing,
   progress,
   scanError,
   onDismissScanError,
 }: ScanScreenProps) {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [pendingFile, setPendingFile] = useState<File | null>(null);
-  const [showCamera, setShowCamera] = useState(false);
+  const [cameraMode, setCameraMode] = useState<'photo' | 'code' | null>(null);
+  const [cameraReady, setCameraReady] = useState(false);
+  const [codeHint, setCodeHint] = useState('Point the camera at the QR or barcode on the pack');
   const [showDisclaimer, setShowDisclaimer] = useState(false);
   const [showGuidance, setShowGuidance] = useState(false);
   const [captureError, setCaptureError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const feedRef = useRef<HTMLDivElement>(null);
+  /** Latest open mode; lets the unmount cleanup stop the stream reliably. */
+  const modeRef = useRef<'photo' | 'code' | null>(null);
 
   const { stream, requestPermission, stopCamera, switchCamera } = useCamera();
-  const isScanning = stage === 'scanning';
+  const isScanning = isAnalyzing;
 
+  // Attach the stream when the dialog opens with a live stream present.
   useEffect(() => {
     const video = videoRef.current;
-    if (showCamera && stream && video) {
+    if (cameraMode && stream && video) {
       video.srcObject = stream;
+      setCameraReady(false);
+      const onReady = () => setCameraReady(true);
+      video.addEventListener('loadeddata', onReady);
       video.play().catch(() => {});
+      if (video.readyState >= 2) setCameraReady(true);
+      return () => video.removeEventListener('loadeddata', onReady);
     }
-    if (!showCamera) stopCamera();
-  }, [showCamera, stream, stopCamera]);
+  }, [cameraMode, stream]);
+
+  // Stop the camera when the dialog closes (intentional close, not re-render).
+  useEffect(() => {
+    modeRef.current = cameraMode;
+    if (cameraMode === null) stopCamera();
+  }, [cameraMode, stopCamera]);
+
+  // Safety net: if the component unmounts while the dialog is open.
+  useEffect(
+    () => () => {
+      if (modeRef.current !== null) stopCamera();
+    },
+    [stopCamera]
+  );
+
+  // Live 'Scan code' loop: decode the current video frame periodically.
+  useEffect(() => {
+    if (cameraMode !== 'code') return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const tick = async () => {
+      const video = videoRef.current;
+      if (video && video.readyState >= 2) {
+        try {
+          const [code] = await decodeLiveFrame(video);
+          if (cancelled) return;
+          if (code) {
+            setCodeHint(`Found ${code.format}: ${code.payload.slice(0, 48)}${code.payload.length > 48 ? '…' : ''}`);
+            return; // stop scanning once a code is found
+          }
+        } catch {
+          // frame decode hiccup — keep looping
+        }
+      }
+      if (!cancelled) timer = window.setTimeout(tick, 350);
+    };
+    void tick();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [cameraMode]);
 
   // Keep the newest progress line visible in the live feed.
   useEffect(() => {
     feedRef.current?.scrollTo({ top: feedRef.current.scrollHeight });
   }, [progress?.message]);
 
-  const adoptFile = useCallback((file: File) => {
+  /** Where the pending image came from; set at adoption time, not sniffed later. */
+  const lastCaptureSource = useRef<CaptureSource>('upload');
+
+  const adoptFile = useCallback((file: File, source: CaptureSource) => {
     if (!file.type.startsWith('image/')) {
       setCaptureError('Please select an image file.');
       return;
@@ -68,6 +121,7 @@ export function ScanScreen({
       setCaptureError('Image size must be less than 15MB.');
       return;
     }
+    lastCaptureSource.current = source;
     setPreviewUrl(URL.createObjectURL(file));
     setPendingFile(file);
     setCaptureError(null);
@@ -76,28 +130,43 @@ export function ScanScreen({
   const handleFileSelect = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
-      if (file) adoptFile(file);
+      if (file) adoptFile(file, 'upload');
       e.target.value = '';
     },
     [adoptFile]
   );
 
-  const handleOpenCamera = useCallback(async () => {
-    setCaptureError(null);
-    setShowCamera(true);
-    try {
-      await requestPermission();
-    } catch {
-      setCaptureError('Camera access denied. Upload an image instead, or enable camera permissions in your browser settings.');
-      setShowCamera(false);
-    }
-  }, [requestPermission]);
+  const handleOpenCamera = useCallback(
+    async (mode: 'photo' | 'code') => {
+      setCaptureError(null);
+      setCodeHint('Point the camera at the QR or barcode on the pack');
+      setCameraMode(mode);
+      try {
+        await requestPermission();
+      } catch {
+        setCaptureError('Camera access denied. Upload an image instead, or enable camera permissions in your browser settings.');
+        setCameraMode(null);
+      }
+    },
+    [requestPermission]
+  );
 
   const handleCameraCapture = useCallback(async () => {
     const video = videoRef.current;
-    if (!video || !video.videoWidth) {
-      setCaptureError('Camera is not ready yet — try again in a moment.');
-      return;
+    if (!video) return;
+    // Wait (briefly) for the stream to actually have frame data.
+    if (!video.videoWidth || video.readyState < 2) {
+      const gotFrames = await Promise.race([
+        new Promise<boolean>(resolve => {
+          const onReady = () => resolve(true);
+          video.addEventListener('loadeddata', onReady, { once: true });
+          window.setTimeout(() => resolve(video.videoWidth > 0), 2500);
+        }),
+      ]);
+      if (!gotFrames) {
+        setCaptureError('Camera is not ready yet — try again in a moment.');
+        return;
+      }
     }
     try {
       const canvas = document.createElement('canvas');
@@ -105,38 +174,38 @@ export function ScanScreen({
       canvas.height = video.videoHeight;
       canvas.getContext('2d')?.drawImage(video, 0, 0);
       const file = await canvasToFile(canvas);
-      setPreviewUrl(URL.createObjectURL(file));
-      setPendingFile(file);
-      setCaptureError(null);
-      setShowCamera(false);
+      adoptFile(file, 'camera');
+      setCameraMode(null);
     } catch (error) {
       setCaptureError(error instanceof Error ? error.message : 'Capture failed.');
     }
-  }, []);
+  }, [adoptFile]);
 
   const handleRetake = useCallback(() => {
     if (previewUrl) URL.revokeObjectURL(previewUrl);
     setPreviewUrl(null);
     setPendingFile(null);
+    lastCaptureSource.current = 'upload';
   }, [previewUrl]);
 
   const handleScan = useCallback(() => {
     if (!pendingFile || isScanning) return;
-    onScanComplete(pendingFile, pendingFile.name.startsWith('capture-') ? 'camera' : 'upload');
+    onScanComplete(pendingFile, lastCaptureSource.current);
   }, [pendingFile, isScanning, onScanComplete]);
 
   const scanLineTop = progress ? Math.min(100, Math.max(0, progress.scanLinePct)) : 0;
 
-  if (showCamera) {
+  if (cameraMode) {
+    const isCodeMode = cameraMode === 'code';
     return (
-      <div className="fixed inset-0 z-50 bg-black flex flex-col" role="dialog" aria-modal="true" aria-label="Camera">
+      <div className="fixed inset-0 z-50 bg-black flex flex-col" role="dialog" aria-modal="true" aria-label={isCodeMode ? 'Scan code' : 'Camera'}>
         <div className="flex items-center justify-between p-4 bg-black/80">
-          <h2 className="text-white font-medium">Capture Medicine Package</h2>
+          <h2 className="text-white font-medium">{isCodeMode ? 'Scan Code' : 'Capture Medicine Package'}</h2>
           <div className="flex items-center gap-2">
             <Button variant="ghost" size="sm" onClick={() => void switchCamera()} aria-label="Switch camera">
               <span className="text-white">⟳</span>
             </Button>
-            <Button variant="ghost" size="sm" onClick={() => setShowCamera(false)} aria-label="Close camera">
+            <Button variant="ghost" size="sm" onClick={() => setCameraMode(null)} aria-label="Close camera">
               <X size={20} className="text-white" />
             </Button>
           </div>
@@ -147,24 +216,38 @@ export function ScanScreen({
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
             <div className="relative w-[80%] aspect-[4/3] border-2 border-white/60 rounded-xl">
               <div className="absolute -top-3 left-1/2 -translate-x-1/2 bg-black/80 px-3 py-1 rounded-full text-white text-sm font-medium whitespace-nowrap">
-                Align package within frame
+                {isCodeMode ? 'Hold steady over the code' : 'Align package within frame'}
               </div>
             </div>
           </div>
+          {!cameraReady && (
+            <div className="absolute inset-0 flex items-center justify-center bg-black/60">
+              <p className="text-white text-sm animate-pulse">Starting camera…</p>
+            </div>
+          )}
         </div>
 
+        {isCodeMode && (
+          <div className="px-4 py-2 bg-black/80 text-center">
+            <p className="text-primary-300 text-sm font-mono" aria-live="polite">{codeHint}</p>
+          </div>
+        )}
+
         <div className="flex items-center justify-center gap-6 p-6 bg-black/80">
-          <Button
-            variant="primary"
-            size="lg"
-            onClick={() => void handleCameraCapture()}
-            className="w-20 h-20 rounded-full p-0"
-            aria-label="Capture photo"
-          >
-            <span className="block w-12 h-12 rounded-full border-4 border-white/80 bg-white/10">
-              <span className="mx-auto mt-3 block w-5 h-5 rounded-full bg-white" />
-            </span>
-          </Button>
+          {!isCodeMode && (
+            <Button
+              variant="primary"
+              size="lg"
+              onClick={() => void handleCameraCapture()}
+              disabled={!cameraReady}
+              className="w-20 h-20 rounded-full p-0"
+              aria-label="Capture photo"
+            >
+              <span className="block w-12 h-12 rounded-full border-4 border-white/80 bg-white/10">
+                <span className="mx-auto mt-3 block w-5 h-5 rounded-full bg-white" />
+              </span>
+            </Button>
+          )}
           <Button variant="ghost" size="lg" onClick={() => setShowGuidance(true)} aria-label="Photography guidance">
             <span className="text-white text-sm">Help</span>
           </Button>
@@ -216,7 +299,7 @@ export function ScanScreen({
 
         {!previewUrl && !isScanning && (
           <div className="space-y-4">
-            <Button variant="primary" fullWidth size="lg" onClick={handleOpenCamera} className="h-16">
+            <Button variant="primary" fullWidth size="lg" onClick={() => void handleOpenCamera('photo')} className="h-16">
               <Camera size={20} />
               Take Photo
             </Button>
@@ -231,6 +314,10 @@ export function ScanScreen({
             <Button variant="secondary" fullWidth size="lg" onClick={() => fileInputRef.current?.click()} className="h-16">
               <Upload size={20} />
               Upload Image
+            </Button>
+            <Button variant="secondary" fullWidth size="lg" onClick={() => void handleOpenCamera('code')} className="h-16">
+              <QrCode size={20} />
+              Scan Code (live)
             </Button>
             <input
               ref={fileInputRef}
@@ -269,15 +356,14 @@ export function ScanScreen({
           <Card variant="elevated" className="animate-fade-in">
             <div className="relative rounded-xl overflow-hidden bg-gray-900 mb-4">
               <img src={previewUrl} alt="Scanning medicine package" className="w-full max-h-[420px] object-contain" />
-              {/* Completed bands get tinted from the top. */}
-              {progress?.completedBands.map(bandIndex => (
+              {/* Completed OCR runs get a thin progress strip tint. */}
+              {progress && progress.completedRuns.length > 0 && (
                 <div
-                  key={bandIndex}
-                  className="absolute left-0 right-0 bg-primary-400/20 border-b border-primary-300/40"
-                  style={{ top: `${((bandIndex - 1) / BAND_COUNT) * 100}%`, height: `${100 / BAND_COUNT}%` }}
+                  className="absolute left-0 right-0 top-0 bg-primary-400/15 border-b border-primary-300/30 transition-[height] duration-300"
+                  style={{ height: `${(progress.completedRuns.length / Math.max(1, progress.totalRuns)) * 100}%` }}
                   aria-hidden="true"
                 />
-              ))}
+              )}
               {/* Scan line follows real analysis progress. */}
               <div
                 className="absolute left-0 right-0 h-[3px] bg-primary-400 shadow-[0_0_12px_2px_rgba(74,222,128,0.8)]"
@@ -308,16 +394,17 @@ export function ScanScreen({
           </Card>
         )}
 
-        <div className="mt-8 space-y-3">
-          <Card variant="outlined" padding="sm">
+        <div className="mt-8 space-y-3">              <Card variant="outlined" padding="sm">
             <div className="flex items-start gap-3">
               <div className="w-8 h-8 rounded-lg bg-primary-100 flex items-center justify-center flex-shrink-0">
                 <Shield size={18} className="text-primary-600" />
               </div>
               <div>
-                <h3 className="font-medium text-gray-900">On-Device Analysis</h3>
+                <h3 className="font-medium text-gray-900">How your photo is analyzed</h3>
                 <p className="text-sm text-gray-500 mt-1">
-                  Text is read from your image with OCR — no mock data, no invented results.
+                  Your image is sent to a vision model when the server has an API key configured; otherwise text is
+                  read on this device with OCR. Either way, only text actually visible in the photo is extracted —
+                  unreadable fields are left blank, never guessed.
                 </p>
               </div>
             </div>
@@ -372,22 +459,19 @@ export function ScanScreen({
   );
 }
 
-/** Reconstructs the feed log from progress state (band messages accumulate via key). */
+/** Live feed of OCR runs, derived from real progress events. */
 function ScanFeedLines({ progress }: { progress: ScanProgress | null }) {
   if (!progress) return <div>&gt; waiting for image…</div>;
-  const lines: string[] = [];
-  if (progress.phase === 'full-pass' || progress.completedBands.length > 0 || progress.phase === 'rotated' || progress.phase === 'merging' || progress.phase === 'extracting') {
-    lines.push('> full image: reading layout…');
+  const lines: string[] = ['> preparing image…'];
+  for (const run of progress.completedRuns) {
+    lines.push(`> ${run}: done`);
   }
-  for (let i = 1; i <= progress.totalBands; i++) {
-    if (i < progress.bandIndex || progress.completedBands.includes(i)) {
-      lines.push(`> band ${i}/${progress.totalBands}: done`);
+  if (progress.phase === 'bands' || progress.phase === 'variants') {
+    lines.push(`> ${progress.message}`);
+    for (const found of progress.lastRunLines) {
+      if (found) lines.push(`    "${found.trim()}"`);
     }
   }
-  if (progress.phase === 'bands' && progress.bandIndex > 0) {
-    lines.push(`> ${progress.message}`);
-  }
-  if (progress.phase === 'rotated') lines.push('> rotated 90°: checking sideways text…');
   if (progress.phase === 'merging') lines.push('> merging overlapping reads…');
   if (progress.phase === 'extracting') lines.push('> extracting fields…');
   return (

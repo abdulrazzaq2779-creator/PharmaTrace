@@ -1,0 +1,74 @@
+[
+  {
+    "manufacturer": "Pfizer Inc.",
+    "products": [
+      { "name": "Lipitor", "strengths": ["10mg", "20mg", "40mg", "80mg"], "dosageForms": ["tablet"] },
+      { "name": "Viagra", "strengths": ["25mg", "50mg", "100mg"], "dosageForms": ["tablet"] },
+      { "name": "Norvasc", "strengths": ["5mg", "10mg"], "dosageForms": ["tablet"] },
+      { "name": "Zoloft", "strengths": ["25mg", "50mg", "100mg"], "dosageForms": ["tablet"] }
+    ]
+  },
+  {
+    "manufacturer": "Novartis",
+    "products": [
+      { "name": "Diovan", "strengths": ["80mg", "160mg", "320mg"], "dosageForms": ["tablet"] },
+      { "name": "Gleevec", "strengths": ["100mg", "400mg"], "dosageForms": ["tablet"] },
+      { "name": "Lamictal", "strengths": ["25mg", "50mg", "100mg", "200mg"], "dosageForms": ["tablet"] }
+    ]
+  },
+  {
+    "manufacturer": "Johnson & Johnson",
+    "products": [
+      { "name": "Tylenol", "strengths": ["325mg", "500mg", "650mg"], "dosageForms": ["tablet", "caplet", "gelcap"] },
+      { "name": "Motrin", "strengths": ["200mg", "400mg", "600mg", "800mg"], "dosageForms": ["tablet"] },
+      { "name": "Risperdal", "strengths": ["0.5mg", "1mg", "2mg", "3mg", "4mg"], "dosageForms": ["tablet"] }
+    ]
+  },
+  {
+    "manufacturer": "Merck & Co.",
+    "products": [
+      { "name": "Januvia", "strengths": ["25mg", "50mg", "100mg"], "dosageForms": ["tablet"] },
+      { "name": "Keytruda", "strengths": ["100mg/4mL"], "dosageForms": ["injection"] },
+      { "name": "Gardasil 9", "strengths": ["0.5mL"], "dosageForms": ["injection"] }
+    ]
+  },
+  {
+    "manufacturer": "Roche",
+    "products": [
+      { "name": "Tamiflu", "strengths": ["30mg", "45mg", "75mg"], "dosageForms": ["capsule"] },
+      { "name": "Herceptin", "strengths": ["150mg", "440mg"], "dosageForms": ["injection"] },
+      { "name": "Avastin", "strengths": ["100mg/4mL", "400mg/16mL"], "dosageForms": ["injection"] }
+    ]
+  },
+  {
+    "manufacturer": "GSK",
+    "products": [
+      { "name": "Advair", "strengths": ["100/50mcg", "250/50mcg", "500/50mcg"], "dosageForms": ["inhaler"] },
+      { "name": "Augmentin", "strengths": ["250/125mg", "500/125mg", "875/125mg"], "dosageForms": ["tablet"] },
+      { "name": "Zofran", "strengths": ["4mg", "8mg"], "dosageForms": ["tablet"] }
+    ]
+  },
+  {
+    "manufacturer": "Sanofi",
+    "products": [
+      { "name": "Lantus", "strengths": ["100 units/mL"], "dosageForms": ["injection"] },
+      { "name": "Plavix", "strengths": ["75mg"], "dosageForms": ["tablet"] },
+      { "name": "Ambien", "strengths": ["5mg", "10mg"], "dosageForms": ["tablet"] }
+    ]
+  },
+  {
+    "manufacturer": "AstraZeneca",
+    "products": [
+      { "name": "Crestor", "strengths": ["5mg", "10mg", "20mg", "40mg"], "dosageForms": ["tablet"] },
+      { "name": "Nexium", "strengths": ["20mg", "40mg"], "dosageForms": ["capsule"] },
+      { "name": "Symbicort", "strengths": ["80/4.5mcg", "160/4.5mcg"], "dosageForms": ["inhaler"] }
+    ]
+  },
+  {
+    "manufacturer": "Mankind Pharma",
+    "products": [
+      { "name": "Amlokind AT", "strengths": ["5mg/50mg"], "dosageForms": ["tablet"] },
+      { "name": "Amlokind", "strengths": ["2.5mg", "5mg", "10mg"], "dosageForms": ["tablet"] }
+    ]
+  }
+]

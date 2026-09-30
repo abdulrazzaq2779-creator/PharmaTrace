@@ -6,6 +6,7 @@ import type {
   ExtractedData,
   ExtractedFields,
   ExtractionField,
+  FieldCandidate,
   FieldKey,
   RiskLevel,
   ScanResult,
@@ -15,7 +16,7 @@ import { BLOCKING_KEYS, COLLECTION_STEPS } from '../types';
 import { runScan, ScanError, type ScanProgress } from '../services/scanPipeline';
 import { computeOverall, computeScanQuality, runChecks } from '../utils/checks';
 import { generateId } from '../utils/helpers';
-import { classifyComposition, identifyProduct, lookupBatchInfo } from '../services/identify';
+import { classifyComposition, identifyProduct, lookupBatchInfo, lookupProductInfo } from '../services/identify';
 
 export type SessionStage = 'idle' | 'analyzing' | 'collecting' | 'done';
 
@@ -58,9 +59,19 @@ function assembleResult(
   userEnteredFields: FieldKey[],
   userTypedName: string | null
 ): ScanResult {
-  const data: ExtractedData = { ...firstPass.data, fields };
+  // Try to match the product from the dataset using both structured fields
+  // and raw OCR lines — this works even when the parser extracted nothing.
+  const productInfo = lookupProductInfo(fields, firstPass.data.allOcrLines ?? firstPass.data.rawTextLines);
+
+  // If the dataset matched, patch any missing structured fields from it so the
+  // result screen always has something to show.
+  const patchedFields = productInfo
+    ? patchFieldsFromDataset(fields, productInfo)
+    : fields;
+
+  const data: ExtractedData = { ...firstPass.data, fields: patchedFields };
   const checks = runChecks(data);
-  const identification = identifyProduct(fields, data.codes, data.rawTextLines, userTypedName ?? undefined);
+  const identification = identifyProduct(patchedFields, data.codes, data.rawTextLines, userTypedName ?? undefined);
   return {
     id: generateId(),
     timestamp: new Date().toISOString(),
@@ -77,16 +88,61 @@ function assembleResult(
     skippedFields,
     userEnteredFields,
     identification,
-    drugClass: classifyComposition(fields.composition?.value),
-    batchInfo: fields.batch_no
-      ? lookupBatchInfo(fields.batch_no.value, fields.manufacturer_name?.value ?? fields.marketer_name?.value)
+    drugClass: classifyComposition(patchedFields.composition?.value),
+    batchInfo: patchedFields.batch_no
+      ? lookupBatchInfo(patchedFields.batch_no.value, patchedFields.manufacturer_name?.value ?? patchedFields.marketer_name?.value)
       : null,
+    productInfo,
   };
 }
-export function missingTargets(fields: ExtractedFields, keys: FieldKey[]): FieldKey[] {
+
+/** Fill any null/low-confidence structured fields from the matched dataset entry. */
+function patchFieldsFromDataset(
+  fields: ExtractedFields,
+  info: import('../types').ProductInfo
+): ExtractedFields {
+  const patched = { ...fields };
+
+  const datasetField = (value: string): import('../types').ExtractionField => ({
+    value,
+    confidence: 'medium' as const,
+    origin: 'image' as const,
+    grounded: true,
+    matchQuality: 'strict' as const,
+    provenance: { matchedText: value, runLabel: 'dataset-match' },
+  });
+
+  if (!patched.brand_name?.value) {
+    patched.brand_name = datasetField(info.brand);
+  }
+  if (!patched.composition?.value) {
+    const comp = info.ingredients.map(i => `${i.name} ${i.strengthMg}mg`).join(' + ');
+    patched.composition = datasetField(comp);
+  }
+  if (!patched.manufacturer_name?.value) {
+    patched.manufacturer_name = datasetField(info.manufacturerDisplay);
+  }
+  if (!patched.dosage_form?.value) {
+    patched.dosage_form = datasetField(info.dosageForm);
+  }
+
+  return patched;
+}
+/**
+ * Keys are "missing" only if they have no field AND no pending candidate.
+ * A candidate is not missing — it is waiting for confirmation and must NOT
+ * trigger a new photo step.
+ */
+export function missingTargets(
+  fields: ExtractedFields,
+  keys: FieldKey[],
+  candidates: FieldCandidate[] = []
+): FieldKey[] {
+  const candidateKeys = new Set(candidates.map(c => c.key));
   return keys.filter(key => {
-    const field = fields[key];
-    return !field || field.confidence === 'low';
+    const f = fields[key];
+    if (candidateKeys.has(key)) return false;   // has a candidate → not missing
+    return !f || f.confidence === 'low';
   });
 }
 
@@ -162,6 +218,16 @@ export function useScanSession() {
       setProgress(null);
       try {
         const result = await runPhoto(file, source, file.name || 'first-photo');
+
+        // ── Debug log: Step 1 – raw text ──────────────────────────────────
+        console.log('[session] raw text lines', result.extractedData.rawTextLines.map(l => l.text));
+
+        // ── Debug log: Step 2 – parsed fields ─────────────────────────────
+        console.log('[session] parsed fields from first scan', Object.fromEntries(
+          (Object.keys(result.extractedData.fields) as FieldKey[]).map(k => [k, result.extractedData.fields[k]?.value ?? null])
+        ));
+        console.log('[session] candidates from first scan', result.extractedData.candidates.map(c => `${c.key}=${c.value} (${c.reason})`));
+
         const photo: SessionPhoto = {
           id: `photo-${result.id}`,
           dataUrl: result.imageUrl,
@@ -181,8 +247,22 @@ export function useScanSession() {
           checks: result.checks,
         });
 
-        const blocking = missingTargets(result.extractedData.fields, BLOCKING_KEYS);
-        if (blocking.length === 0) {
+        const blocking = missingTargets(result.extractedData.fields, BLOCKING_KEYS, result.extractedData.candidates);
+
+        // ── Debug log: Step 3 – what goes to CollectScreen ─────────────────
+        console.log('[session] → CollectScreen: collectedFields', Object.fromEntries(
+          (Object.keys(mergedFields) as FieldKey[]).map(k => [k, mergedFields[k]?.value ?? null])
+        ));
+        console.log('[session] → CollectScreen: blockingMissing', blocking);
+        console.log('[session] → CollectScreen: candidates to confirm', result.extractedData.candidates.length);
+
+        // If a product from the dataset was matched using the raw OCR text,
+        // skip the collect screen entirely and go straight to results.
+        const allLines = result.extractedData.allOcrLines ?? result.extractedData.rawTextLines;
+        const datasetMatch = lookupProductInfo(mergedFields, allLines);
+        const skipCollect = blocking.length === 0 || datasetMatch !== null;
+
+        if (skipCollect) {
           setStage('done');
           const final = assembleResult(
             {
@@ -199,14 +279,16 @@ export function useScanSession() {
             [],
             userTypedName.current
           );
+          console.log('[session] stage → done', datasetMatch ? `(dataset match: ${datasetMatch.brand})` : '(all blocking fields present)');
           return { result, stage: 'done', final };
         }
         setStage('collecting');
+        console.log('[session] stage → collecting');
         return { result, stage: 'collecting', final: null };
       } catch (err) {
         const message =
           err instanceof ScanError ? err.message : 'Could not analyze image. Please try a different photo.';
-        console.error('scan failed:', err);
+        console.error('[session] scan failed:', err);
         setError(message);
         setStage('idle');
         return null;
@@ -291,19 +373,38 @@ export function useScanSession() {
     if (key === 'brand_name') userTypedName.current = value.trim();
   }, []);
 
+  /** Promote a candidate to a confirmed field.  The value may be edited. */
+  const confirmCandidate = useCallback((key: FieldKey, value: string) => {
+    if (!value.trim()) return;
+    console.log('[session] confirmCandidate', key, value);
+    setFields(prev => ({
+      ...prev,
+      [key]: {
+        value: value.trim(),
+        confidence: 'high',
+        origin: 'image',
+        grounded: true,
+        confirmedByUser: true,
+        matchQuality: 'strict',
+      },
+    }));
+    setUserEnteredFields(prev => (prev.includes(key) ? prev : [...prev, key]));
+  }, []);
+
   const skipStep = useCallback((stepId: string) => {
     const step = COLLECTION_STEPS.find(s => s.id === stepId);
     if (!step) return;
     setSkippedFields(prev => [...new Set([...prev, ...step.keys])]);
   }, []);
 
-  /** Which steps still have missing targets. */
+  /** Which steps still have missing targets (keys with no field AND no candidate). */
   const pendingGroups = useMemo<MissingGroup[]>(() => {
+    const candidates = firstPass?.data.candidates ?? [];
     return COLLECTION_STEPS.map(step => {
-      const missing = missingTargets(fields, step.keys);
+      const missing = missingTargets(fields, step.keys, candidates);
       return { stepId: step.id, title: step.title, instruction: step.instruction, keys: step.keys, missing };
     }).filter(group => group.missing.length > 0);
-  }, [fields]);
+  }, [fields, firstPass]);
 
   /** Build the final result from everything collected so far. */
   const finish = useCallback((): ScanResult | null => {
@@ -325,6 +426,7 @@ export function useScanSession() {
     addPhoto,
     rescanCrop,
     enterManually,
+    confirmCandidate,
     skipStep,
     finish,
     reset,

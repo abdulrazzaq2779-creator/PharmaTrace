@@ -7,5 +7,23 @@
     "exp": "03/2028",
     "source": "Pack print verified during OCR lab test",
     "status": "reference"
+  },
+  {
+    "batch": "IUT24008",
+    "product": "Immutil 500",
+    "manufacturer": "Ravian Life Science / La Renon Healthcare",
+    "mfg": "06/2024",
+    "exp": "05/2027",
+    "source": "Demo pack reference",
+    "status": "reference"
+  },
+  {
+    "batch": "B7426A",
+    "product": "ColdRelief-Plus",
+    "manufacturer": "Sunrise Pharmaceuticals",
+    "mfg": "08/2024",
+    "exp": "08/2026",
+    "source": "Demo pack reference (MOCK — strength mismatch expected)",
+    "status": "reference"
   }
 ]

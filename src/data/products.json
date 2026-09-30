@@ -70,5 +70,29 @@
       { "name": "Amlokind AT", "strengths": ["5mg/50mg"], "dosageForms": ["tablet"] },
       { "name": "Amlokind", "strengths": ["2.5mg", "5mg", "10mg"], "dosageForms": ["tablet"] }
     ]
+  },
+  {
+    "manufacturer": "La Renon Healthcare",
+    "products": [
+      { "name": "Immutil 500", "strengths": ["500mg"], "dosageForms": ["tablet"] }
+    ]
+  },
+  {
+    "manufacturer": "Ravian Life Science",
+    "products": [
+      { "name": "Immutil 500", "strengths": ["500mg"], "dosageForms": ["tablet"] }
+    ]
+  },
+  {
+    "manufacturer": "Primus Remedies",
+    "products": [
+      { "name": "Glimiprime-M3 Forte", "strengths": ["1000mg/3mg"], "dosageForms": ["tablet"] }
+    ]
+  },
+  {
+    "manufacturer": "Sunrise Pharmaceuticals",
+    "products": [
+      { "name": "ColdRelief-Plus", "strengths": ["500mg/2mg/5mg"], "dosageForms": ["tablet"] }
+    ]
   }
 ]

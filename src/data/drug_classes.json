@@ -4,5 +4,10 @@
   "telmisartan": "Blood pressure (antihypertensive)",
   "metformin": "Diabetes (antidiabetic)",
   "glimepiride": "Diabetes (antidiabetic)",
-  "atorvastatin": "Cholesterol (statin)"
+  "atorvastatin": "Cholesterol (statin)",
+  "mycophenolate": "Immunosuppressant (transplant medicine)",
+  "mycophenolate mofetil": "Immunosuppressant (transplant medicine)",
+  "paracetamol": "Pain / fever relief (analgesic / antipyretic)",
+  "chlorpheniramine": "Cold and allergy relief (antihistamine)",
+  "phenylephrine": "Cold and allergy relief (decongestant)"
 }

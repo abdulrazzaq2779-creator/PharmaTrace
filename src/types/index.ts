@@ -4,6 +4,8 @@ export type CaptureSource = 'camera' | 'upload';
 
 export type FieldOrigin = 'image' | 'user';
 
+export type MatchQuality = 'strict' | 'fuzzy' | 'unlabeled';
+
 /** Where one extracted value came from. */
 export interface FieldProvenance {
   /** The photo (session photo id) the value was read from. */
@@ -23,6 +25,25 @@ export interface ExtractionField {
   /** 'image' = read from a photo; 'user' = typed manually (lower-confidence evidence). */
   origin: FieldOrigin;
   provenance?: FieldProvenance;
+  /** True when the value fuzzy-matches a raw OCR/vision line. */
+  grounded?: boolean;
+  /** User accepted a candidate (or typed a correction). */
+  confirmedByUser?: boolean;
+  matchQuality?: MatchQuality;
+  /** Digit confusions such as 6 vs 8. */
+  ambiguous?: boolean;
+  ambiguousHint?: string;
+}
+
+/** A parsed value that must not be silently accepted. */
+export interface FieldCandidate {
+  key: FieldKey;
+  value: string;
+  matchedText: string;
+  bbox?: BBox;
+  confidence: 'high' | 'medium' | 'low';
+  reason: 'fuzzy' | 'low-confidence' | 'currency' | 'ambiguous-digit' | 'unlabeled';
+  ambiguousHint?: string;
 }
 
 export type FieldKey =
@@ -120,6 +141,26 @@ export interface BatchInfoResult {
   formatCheck: { status: 'pass' | 'fail' | 'unknown'; detail: string } | null;
 }
 
+/** Full medicine information from the product_info dataset. */
+export interface ProductIngredient {
+  name: string;
+  keywords: string[];
+  strengthMg: number;
+}
+
+export interface ProductInfo {
+  id: string;
+  brand: string;
+  dosageForm: string;
+  drugClass: string;
+  ingredients: ProductIngredient[];
+  manufacturerDisplay: string;
+  licenseNo: string | null;
+  uses: string;
+  sideEffects: string[];
+  warnings: string[];
+}
+
 export interface ExtractedData {
   usable: boolean;
   /** Why the image was rejected as a medicine pack. */
@@ -127,11 +168,34 @@ export interface ExtractedData {
   /** How many medicine keywords the text contained. */
   keywordHits: number;
   fields: ExtractedFields;
+  /** Parsed values that need the user to confirm, edit, or retake. */
+  candidates: FieldCandidate[];
   rawTextLines: TextLine[];
+  /** ALL OCR lines including low-confidence — used only for dataset keyword matching. */
+  allOcrLines: TextLine[];
   unreadableRegions: UnreadableRegion[];
   blurScore: number;
   /** QR/barcodes decoded from the image (client-side, both analyzer paths). */
   codes: DecodedCode[];
+}
+
+/** Brand, composition, manufacturer, batch, MFG, EXP, MRP. */
+export const KEY_DETAIL_KEYS: FieldKey[] = [
+  'brand_name',
+  'composition',
+  'manufacturer_name',
+  'batch_no',
+  'mfg_date',
+  'expiry_date',
+  'mrp',
+];
+
+/** A confidently read or user-confirmed value counts toward "X of 7". */
+export function fieldCountsAsCollected(field: ExtractionField | null | undefined): boolean {
+  if (!field?.value) return false;
+  if (field.confirmedByUser || field.origin === 'user') return true;
+  if (field.grounded === false) return false;
+  return field.confidence === 'high' || field.confidence === 'medium';
 }
 
 export interface CheckResult {
@@ -178,6 +242,8 @@ export interface ScanResult {
   drugClass: DrugClassInfo | null;
   /** Batch reference-data lookup + format check, when a batch was read. */
   batchInfo: BatchInfoResult | null;
+  /** Full medicine info from product_info.json, when the product was matched. */
+  productInfo: ProductInfo | null;
 }
 
 export type Screen = 'scan' | 'results' | 'history' | 'settings' | 'collect';

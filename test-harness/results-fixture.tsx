@@ -97,6 +97,7 @@ const fixture: ScanResult = {
     },
     formatCheck: { status: 'unknown', detail: 'No known batch pattern for this manufacturer — format cannot be checked.' },
   },
+  productInfo: null,
 };
 
 const root = createRoot(document.getElementById('root')!);

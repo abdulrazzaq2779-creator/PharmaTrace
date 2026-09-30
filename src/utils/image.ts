@@ -234,6 +234,54 @@ export function cropRegion(source: HTMLCanvasElement, bbox: BBox): HTMLCanvasEle
   return out;
 }
 
+export interface NamedCrop {
+  label: string;
+  canvas: HTMLCanvasElement;
+  bbox: BBox;
+}
+
+/** Left and right 20% edges — blister strips print batch/EXP sideways here. */
+export function edgeStripCrops(source: HTMLCanvasElement, fraction = 0.2): NamedCrop[] {
+  const w = source.width;
+  const h = source.height;
+  const strip = Math.max(24, Math.round(w * fraction));
+  const left: BBox = { x0: 0, y0: 0, x1: strip, y1: h };
+  const right: BBox = { x0: Math.max(0, w - strip), y0: 0, x1: w, y1: h };
+  return [
+    { label: 'left-edge', canvas: cropRegion(source, left), bbox: left },
+    { label: 'right-edge', canvas: cropRegion(source, right), bbox: right },
+  ];
+}
+
+export function expandBBox(bbox: BBox, pad: number, width: number, height: number): BBox {
+  return {
+    x0: Math.max(0, bbox.x0 - pad),
+    y0: Math.max(0, bbox.y0 - pad),
+    x1: Math.min(width, bbox.x1 + pad),
+    y1: Math.min(height, bbox.y1 + pad),
+  };
+}
+
+/** Crop around a decoded QR/barcode so nearby batch text is included. */
+export function codeNeighborhoodCrop(source: HTMLCanvasElement, bbox: BBox, pad = 80): NamedCrop {
+  const expanded = expandBBox(bbox, pad, source.width, source.height);
+  return { label: 'code-neighborhood', canvas: cropRegion(source, expanded), bbox: expanded };
+}
+
+/** Tall, narrow boxes (sideways print). */
+export function tallNarrowCrops(source: HTMLCanvasElement, boxes: BBox[]): NamedCrop[] {
+  const out: NamedCrop[] = [];
+  boxes.forEach((bbox, i) => {
+    const w = Math.max(1, bbox.x1 - bbox.x0);
+    const h = Math.max(1, bbox.y1 - bbox.y0);
+    if (h >= w * 2.5 && h >= 40) {
+      const expanded = expandBBox(bbox, 12, source.width, source.height);
+      out.push({ label: `tall-narrow-${i}`, canvas: cropRegion(source, expanded), bbox: expanded });
+    }
+  });
+  return out;
+}
+
 import type { BBox } from '../types';
 
 /** Estimate blur via variance of the Laplacian. Lower = blurrier. */

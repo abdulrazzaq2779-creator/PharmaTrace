@@ -20,7 +20,7 @@ import { Card } from '../components/Card';
 import { Badge } from '../components/Badge';
 import { Modal } from '../components/Modal';
 import { Input } from '../components/Input';
-import type { BBox, CheckResult, DecodedCode, FieldKey, RiskLevel, ScanResult, SessionPhoto, TextLine } from '../types';
+import type { BBox, CheckResult, DecodedCode, FieldKey, ProductInfo, RiskLevel, ScanResult, SessionPhoto, TextLine } from '../types';
 import { BLOCKING_KEYS } from '../types';
 import { FIELD_LABELS, riskLevelDescriptions, riskLevelLabels } from '../data/content';
 import { buildReportText } from '../utils/report';
@@ -268,6 +268,11 @@ export function ResultsScreen({
             Composition suggests: {scanResult.drugClass.classes.join(', ')}. General information only, follow your
             doctor's prescription.
           </div>
+        )}
+
+        {/* Medicine information from product dataset */}
+        {scanResult.productInfo && (
+          <MedicineInfoCard info={scanResult.productInfo} />
         )}
 
         {/* Batch information panel */}
@@ -864,3 +869,85 @@ function debugPayload(scan: ScanResult) {
 }
 
 export type { TextLine };
+
+
+function MedicineInfoCard({ info }: { info: ProductInfo }) {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <Card variant="elevated" padding="md" className="mt-6 border-primary-200">
+      {/* Header */}
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex-1">
+          <div className="flex items-center gap-2 flex-wrap">
+            <h3 className="font-bold text-gray-900 text-base">{info.brand}</h3>
+            <Badge variant="info" size="sm">{info.drugClass}</Badge>
+          </div>
+          <p className="text-xs text-gray-500 mt-0.5">{info.dosageForm}</p>
+          <p className="text-xs text-gray-500">{info.manufacturerDisplay}</p>
+          {info.licenseNo && (
+            <p className="text-xs text-gray-400 mt-0.5 font-mono">Lic: {info.licenseNo}</p>
+          )}
+        </div>
+        <button
+          className="text-xs text-primary-600 font-medium shrink-0 mt-1"
+          onClick={() => setExpanded(prev => !prev)}
+          aria-expanded={expanded}
+        >
+          {expanded ? 'Show less' : 'Show more'}
+        </button>
+      </div>
+
+      {/* Ingredients — always shown */}
+      <div className="mt-3 pt-3 border-t border-gray-100">
+        <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Ingredients</p>
+        <ul className="space-y-0.5">
+          {info.ingredients.map(ing => (
+            <li key={ing.name} className="text-sm text-gray-800">
+              {ing.name}{' '}
+              <span className="text-gray-500 font-mono text-xs">{ing.strengthMg} mg</span>
+            </li>
+          ))}
+        </ul>
+      </div>
+
+      {/* Uses — always shown */}
+      <div className="mt-3 pt-3 border-t border-gray-100">
+        <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Uses</p>
+        <p className="text-sm text-gray-800">{info.uses}</p>
+      </div>
+
+      {/* Side effects + warnings — shown only when expanded */}
+      {expanded && (
+        <>
+          <div className="mt-3 pt-3 border-t border-gray-100">
+            <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Common side effects</p>
+            <ul className="space-y-1">
+              {info.sideEffects.map((effect, i) => (
+                <li key={i} className="text-sm text-gray-800 flex items-start gap-2">
+                  <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-warning-400 shrink-0" aria-hidden="true" />
+                  {effect}
+                </li>
+              ))}
+            </ul>
+          </div>
+
+          <div className="mt-3 pt-3 border-t border-gray-100">
+            <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Warnings</p>
+            <ul className="space-y-1">
+              {info.warnings.map((warning, i) => (
+                <li key={i} className="text-sm text-gray-800 flex items-start gap-2">
+                  <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-danger-400 shrink-0" aria-hidden="true" />
+                  {warning}
+                </li>
+              ))}
+            </ul>
+          </div>
+        </>
+      )}
+
+      <p className="mt-3 text-xs text-gray-400">
+        General information only. Always follow your doctor's or pharmacist's instructions.
+      </p>
+    </Card>
+  );
+}

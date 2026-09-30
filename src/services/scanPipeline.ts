@@ -3,16 +3,19 @@ import type { BBox, CaptureSource, DecodedCode, ExtractedData, ExtractionField, 
 import {
   adaptiveThreshold,
   canvasToJpeg,
+  codeNeighborhoodCrop,
   cropRegion,
   decodeImage,
+  edgeStripCrops,
   estimateBlur,
   grayscaleNormalized,
   makeThumbnail,
   rotateQuarter,
   splitIntoBands,
+  tallNarrowCrops,
   upscaleForOcr,
 } from '../utils/image';
-import { extractFields } from './extract';
+import { extractFields, groundExtractedData, mergeExtractedData } from './extract';
 import { decodeCodes } from './barcode';
 import { computeOverall, computeScanQuality, runChecks } from '../utils/checks';
 import { generateId } from '../utils/helpers';
@@ -89,12 +92,12 @@ export function linesFromTesseract(data: unknown): RawLine[] {
 }
 
 /** Drop junk: low word-confidence or mostly-symbol lines. */
-function passesQualityFilter(line: RawLine): boolean {
-  if (line.confidence < MIN_WORD_CONF) return false;
+function passesQualityFilter(line: RawLine, minConf = MIN_WORD_CONF, minAlnum = MIN_ALNUM_RATIO): boolean {
+  if (line.confidence < minConf) return false;
   const chars = line.text.replace(/\s/g, '');
   if (chars.length === 0) return false;
   const alnum = chars.replace(/[^a-zA-Z0-9.,:/+\-₹]/g, '').length;
-  return alnum / chars.length >= MIN_ALNUM_RATIO;
+  return alnum / chars.length >= minAlnum;
 }
 
 /** Map a bbox from a rotated canvas back to original coordinates. */
@@ -158,6 +161,105 @@ function isDuplicate(a: TextLine, b: TextLine): boolean {
   if (!na || !nb) return false;
   const sameText = na === nb || (na.length >= 6 && nb.length >= 6 && (na.includes(nb) || nb.includes(na)));
   return sameText && iou(a.bbox, b.bbox) > 0.2;
+}
+
+function mapFromUpscaledRotated(
+  bbox: BBox,
+  turns: number,
+  rotatedW: number,
+  rotatedH: number,
+  scale: number,
+  cropOrigin: BBox
+): BBox {
+  const local: BBox = {
+    x0: bbox.x0 / scale,
+    y0: bbox.y0 / scale,
+    x1: bbox.x1 / scale,
+    y1: bbox.y1 / scale,
+  };
+  const inCrop = mapRotatedBoxToOriginal(local, turns, rotatedW, rotatedH);
+  return {
+    x0: inCrop.x0 + cropOrigin.x0,
+    y0: inCrop.y0 + cropOrigin.y0,
+    x1: inCrop.x1 + cropOrigin.x0,
+    y1: inCrop.y1 + cropOrigin.y0,
+  };
+}
+
+const STRIP_MIN_EDGE = 1600;
+
+async function recognizeDedicatedStrips(
+  worker: Awaited<ReturnType<typeof createWorker>>,
+  source: HTMLCanvasElement,
+  codes: DecodedCode[],
+  existingBoxes: BBox[],
+  onProgress: (p: ScanProgress) => void
+): Promise<TextLine[]> {
+  const crops = [
+    ...edgeStripCrops(source, 0.2),
+    ...tallNarrowCrops(source, existingBoxes),
+    ...codes.filter(c => c.bbox).map(c => codeNeighborhoodCrop(source, c.bbox as BBox, 90)),
+  ];
+  const lines: TextLine[] = [];
+  let run = 0;
+  for (const crop of crops) {
+    if (crop.canvas.width < 8 || crop.canvas.height < 8) continue;
+    for (const turns of [1, 3] as const) {
+      const rotated = rotateQuarter(crop.canvas, turns);
+      const upscaled = upscaleForOcr(rotated, STRIP_MIN_EDGE);
+      const gray = grayscaleNormalized(upscaled);
+      const scale = upscaled.width / Math.max(1, rotated.width);
+      await worker.setParameters({ tessedit_pageseg_mode: 6 as unknown as PSM });
+      const blockResult = await worker.recognize(gray, {}, { blocks: true });
+      const blockLines = linesFromTesseract(blockResult.data).filter(l =>
+        passesQualityFilter(l, 30, 0.25)
+      );
+      run += 1;
+      onProgress({
+        phase: 'variants',
+        message: `Sideways strip ${crop.label} ${turns * 90}°: ${blockLines.length} lines`,
+        scanLinePct: 90,
+        completedRuns: [`strip·${crop.label}·${turns * 90}`],
+        totalRuns: crops.length * 2,
+        lastRunLines: blockLines.slice(0, 4).map(l => l.text.trim()),
+      });
+      for (const line of blockLines) {
+        const mapped = mapFromUpscaledRotated(line.bbox, turns, rotated.width, rotated.height, scale, crop.bbox);
+        lines.push({
+          text: line.text,
+          bbox: mapped,
+          band: 0,
+          confidence: confidenceFromTesseract(line.confidence),
+          wordConfidence: line.confidence,
+          runLabel: `strip·${crop.label}·psm6·${turns * 90}`,
+          orientation: turns === 1 ? 1 : 2,
+        });
+        const lineCrop = cropRegion(gray, line.bbox);
+        if (lineCrop.width < 4 || lineCrop.height < 4) continue;
+        await worker.setParameters({ tessedit_pageseg_mode: 7 as unknown as PSM });
+        const lineResult = await worker.recognize(lineCrop, {}, { blocks: true });
+        for (const one of linesFromTesseract(lineResult.data).filter(l => passesQualityFilter(l, 25, 0.2))) {
+          const oneBox: BBox = {
+            x0: line.bbox.x0 + one.bbox.x0,
+            y0: line.bbox.y0 + one.bbox.y0,
+            x1: line.bbox.x0 + Math.max(one.bbox.x1, 1),
+            y1: line.bbox.y0 + Math.max(one.bbox.y1, 1),
+          };
+          lines.push({
+            text: one.text,
+            bbox: mapFromUpscaledRotated(oneBox, turns, rotated.width, rotated.height, scale, crop.bbox),
+            band: 0,
+            confidence: confidenceFromTesseract(one.confidence),
+            wordConfidence: one.confidence,
+            runLabel: `strip·${crop.label}·psm7·${turns * 90}`,
+            orientation: turns === 1 ? 1 : 2,
+          });
+        }
+      }
+    }
+  }
+  console.log('sideways-strip OCR lines', lines.length, 'from', run, 'runs');
+  return lines;
 }
 
 // ---------------------------------------------------------------------------
@@ -335,11 +437,23 @@ export async function runScan(
   try {
     const vision = await analyzeWithVisionModel(canvasToJpeg(sourceCanvas));
     if (vision) {
+      onProgress(progressFor('extracting', 'Grounding vision text…', 70, [], 100, []));
+      let data = dataFromVision(vision, blurScore, codes);
+      const worker = await createWorker('eng');
+      try {
+        const stripLines = await recognizeDedicatedStrips(worker, sourceCanvas, codes, data.rawTextLines.map(l => l.bbox), onProgress);
+        if (stripLines.length > 0) {
+          data = mergeExtractedData(data, extractFields(stripLines, blurScore, codes));
+        }
+      } finally {
+        await worker.terminate();
+      }
+      data = groundExtractedData(data);
+      logSessionParse(data);
       onProgress(progressFor('extracting', 'Building result…', 100, [], 100, []));
-      const data = dataFromVision(vision, blurScore, codes);
       return {
         result: buildResult(data, thumbnail, input.source, 'vision-model', width, height),
-        raw: vision,
+        raw: { vision, mergedText: data.rawTextLines.map(l => l.text) },
       };
     }
   } catch (error) {
@@ -408,13 +522,39 @@ export async function runScan(
 
     onProgress(progressFor('merging', 'Merging reads…', 95, completed, totalRuns, []));
     const allPasses = runsToTextLines(runs, variantSizes, { w: width, h: height });
-    const merged = mergeLines([...allPasses, ...bandLines]);
-    console.log('merged lines', merged.length, 'from', allPasses.length + bandLines.length, 'passes');
+    const stripLines = await recognizeDedicatedStrips(
+      worker,
+      sourceCanvas,
+      codes,
+      [...allPasses, ...bandLines].flat().map(l => l.bbox),
+      onProgress
+    );
+    const merged = mergeLines([...allPasses, ...bandLines, stripLines]);
+    console.log('merged raw text', merged.map(l => l.text).join(' | '));
+    console.log('merged lines', merged.length, 'from', allPasses.length + bandLines.length + 1, 'passes');
 
-    // Pick the best orientation's lines for field extraction:
-    // keep lines from ALL orientations but let extraction run on the union.
+    // Collect ALL lines without the quality filter — used only for dataset keyword matching.
+    const allOcrLines: TextLine[] = runs.flatMap((run, i) => {
+      const [variantLabel, rotationLabel] = run.label.split('·');
+      const turns = parseInt(rotationLabel, 10) / 90;
+      const size = variantSizes[variantLabel] ?? { w: width, h: height };
+      return run.lines.map(line => ({
+        text: line.text,
+        bbox: mapRotatedBoxToOriginal(line.bbox, turns, size.w, size.h),
+        band: 0,
+        confidence: confidenceFromTesseract(line.confidence),
+        wordConfidence: line.confidence,
+        runLabel: run.label,
+        orientation: (turns === 0 ? 0 : turns === 1 ? 1 : 2) as 0 | 1 | 2,
+      }));
+    });
+    console.log('[allOcrLines] total unfiltered lines:', allOcrLines.length);
+
     onProgress(progressFor('extracting', 'Extracting fields…', 99, completed, totalRuns, []));
     const data = extractFields(merged, blurScore, codes);
+    // Override allOcrLines with the full unfiltered set so dataset matching has everything.
+    data.allOcrLines = allOcrLines;
+    logSessionParse(data);
 
     if (!data.fields.qr_or_barcode_present) {
       const barcode = merged.find(line => /\d{8,}/.test(line.text));
@@ -461,38 +601,63 @@ function buildResult(
   };
 }
 
+function logSessionParse(data: ExtractedData): void {
+  console.log('merged raw text', data.rawTextLines.map(l => l.text).join('\n'));
+  console.log(
+    'parsed fields',
+    Object.fromEntries((Object.keys(data.fields) as FieldKey[]).map(k => [k, data.fields[k]?.value ?? null]))
+  );
+  console.log(
+    'candidates',
+    data.candidates.map(c => ({ key: c.key, value: c.value, reason: c.reason, matchedText: c.matchedText }))
+  );
+}
+
 function dataFromVision(vision: VisionResponse, blurScore: number, codes: DecodedCode[]): ExtractedData {
   const textLines: TextLine[] = (vision.text_lines ?? []).map(line => ({
     text: line.text,
-    bbox: line.bbox,
+    bbox: line.bbox ?? { x0: 0, y0: 0, x1: 0, y1: 0 },
     band: 0,
     confidence: line.confidence >= HIGH_CONF ? 'high' : line.confidence >= MEDIUM_CONF ? 'medium' : 'low',
     wordConfidence: line.confidence,
     orientation: 0,
   }));
+  const parsed = extractFields(textLines, blurScore, codes);
   const fields = emptyFields();
   if (vision.fields) {
     for (const key of Object.keys(fields) as FieldKey[]) {
       const value = vision.fields[key];
       if (value && typeof value.value === 'string' && value.value.trim() !== '') {
-        fields[key] = { value: value.value.trim(), confidence: value.confidence ?? 'low', origin: 'image' };
+        const line =
+          textLines.find(l => fuzzyLineHas(l.text, value.value)) ??
+          textLines.find(l => l.bbox && vision.fields?.[key]);
+        fields[key] = {
+          value: value.value.trim(),
+          confidence: value.confidence ?? 'low',
+          origin: 'image',
+          matchQuality: value.confidence === 'high' ? 'strict' : 'fuzzy',
+          provenance: line
+            ? { bbox: line.bbox, matchedText: line.text.trim(), runLabel: 'vision' }
+            : undefined,
+        };
       }
     }
   }
-  return {
-    usable: vision.usable,
-    rejectReason: vision.reject_reason,
-    keywordHits: countKeywords(textLines.map(l => l.text).join('\n')),
+  const merged = mergeExtractedData(parsed, {
+    ...parsed,
     fields,
-    rawTextLines: textLines,
-    unreadableRegions: (vision.unreadable_regions ?? []).map(r => ({
-      bbox: r.bbox,
-      text: r.reason,
-      confidence: 0,
-    })),
-    blurScore,
-    codes,
-  };
+    candidates: [],
+  });
+  const grounded = groundExtractedData(merged);
+  // For vision model: all text_lines are "unfiltered" (the model already handles confidence).
+  grounded.allOcrLines = textLines;
+  return grounded;
+}
+
+function fuzzyLineHas(line: string, value: string): boolean {
+  const hay = line.toUpperCase().replace(/[^A-Z0-9]+/g, '');
+  const ned = value.toUpperCase().replace(/[^A-Z0-9]+/g, '');
+  return ned.length >= 3 && hay.includes(ned);
 }
 
 function emptyFields(): Record<FieldKey, ExtractionField | null> {

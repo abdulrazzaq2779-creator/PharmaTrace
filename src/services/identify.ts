@@ -7,12 +7,14 @@ import type {
   ExtractionField,
   Identification,
   IdentificationMethod,
+  ProductInfo,
 } from '../types';
 import { productCatalog } from './extract';
 import { parseCodePayload } from './barcode';
 import drugClassesJson from '../data/drug_classes.json';
 import batchesJson from '../data/batches.json';
 import manufacturersJson from '../data/manufacturers.json';
+import productInfoJson from '../data/product_info.json';
 
 // ---------------------------------------------------------------------------
 // Reference data (static, versioned JSON — never hardcoded in flow logic)
@@ -326,6 +328,68 @@ export function lookupBatchInfo(batchValue: string, manufacturer?: string): Batc
   }
 
   return { batch: batchValue, reference, formatCheck };
+}
+
+// ---------------------------------------------------------------------------
+// Product info lookup (uses / sideEffects / warnings from product_info.json)
+// ---------------------------------------------------------------------------
+
+const PRODUCT_INFO = productInfoJson as ProductInfo[];
+
+/**
+ * Match the scanned pack against the product_info dataset.
+ * Searches structured fields first, then falls back to raw OCR text lines
+ * so a match works even when the parser extracted nothing.
+ *
+ * Scoring:
+ *   brand keyword in brand field or raw text  → 4 pts
+ *   ingredient keyword in composition or raw  → 2 pts
+ *   manufacturer keyword in mfr field or raw  → 1 pt
+ */
+export function lookupProductInfo(
+  fields: ExtractedFields,
+  rawTextLines: Array<{ text: string }> = []
+): ProductInfo | null {
+  const rawText = rawTextLines.map(l => l.text).join(' ').toLowerCase();
+
+  const brandVal   = (fields.brand_name?.value ?? '').toLowerCase();
+  const compVal    = (fields.composition?.value ?? '').toLowerCase();
+  const mfrVal     = ((fields.manufacturer_name?.value ?? '') + ' ' + (fields.marketer_name?.value ?? '')).toLowerCase();
+
+  // Combined search string: structured fields + raw OCR lines
+  const allText = `${brandVal} ${compVal} ${mfrVal} ${rawText}`;
+
+  let best: { info: ProductInfo; score: number } | null = null;
+
+  for (const entry of PRODUCT_INFO) {
+    let score = 0;
+
+    // 1. Brand keyword (4 pts — strongest signal)
+    for (const kw of entry.brandKeywords) {
+      if (allText.includes(kw.toLowerCase())) score += 4;
+    }
+
+    // 2. Ingredient keyword (2 pts each)
+    for (const ingredient of entry.ingredients) {
+      for (const kw of ingredient.keywords) {
+        if (allText.includes(kw.toLowerCase())) score += 2;
+      }
+    }
+
+    // 3. Manufacturer keyword (1 pt each)
+    for (const kw of entry.manufacturerKeywords) {
+      if (allText.includes(kw.toLowerCase())) score += 1;
+    }
+
+    if (score > 0 && (!best || score > best.score)) {
+      best = { info: entry, score };
+    }
+  }
+
+  if (best) {
+    console.log('[lookupProductInfo] matched:', best.info.brand, 'score', best.score);
+  }
+  return best ? best.info : null;
 }
 
 // ---------------------------------------------------------------------------

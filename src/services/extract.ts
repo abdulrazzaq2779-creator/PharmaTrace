@@ -4,10 +4,20 @@ import type {
   ExtractedData,
   ExtractedFields,
   ExtractionField,
+  FieldCandidate,
   FieldKey,
+  MatchQuality,
   TextLine,
 } from '../types';
 import productsJson from '../data/products.json';
+import {
+  editDistance,
+  findSourceLine,
+  fuzzyContains,
+  hasDollarPrice,
+  looksIndianPack,
+  repairLabelConfusions,
+} from '../utils/grounding';
 
 export type ManufacturerCatalogEntry = {
   manufacturer: string;
@@ -62,17 +72,21 @@ function field(
   value: string,
   confidence: ExtractionField['confidence'],
   line: TextLine,
-  matchedText: string
+  matchedText: string,
+  extras?: Partial<ExtractionField>
 ): ExtractionField {
   return {
     value,
     confidence,
     origin: 'image',
+    grounded: true,
+    matchQuality: extras?.matchQuality ?? 'strict',
     provenance: {
       bbox: line.bbox,
       matchedText: cleanLine(matchedText),
       runLabel: line.runLabel,
     },
+    ...extras,
   };
 }
 
@@ -110,49 +124,185 @@ export function normalizeDate(raw: string): string {
 // Field extraction — tolerant regexes; null when nothing matched
 // ---------------------------------------------------------------------------
 
-function extractBatch(lines: TextLine[]): ExtractionField | null {
-  // (B\.?\s*No\.?|Batch\s*No\.?|Lot)\s*[:.\-]?\s*([A-Z0-9]{5,12})
-  const hit = matchLine(
-    lines,
-    /\b(?:B\.?\s*No\.?|Batch\s*No\.?|Batch|Lot)\b\s*[:.\-]?\s*([A-Za-z0-9][A-Za-z0-9-]{4,15})/i
-  );
-  if (!hit) return null;
-  const value = hit.match[1].toUpperCase().replace(/[^A-Z0-9-]/g, '');
-  return field(value, /\b(b\.?\s*no|batch|lot)\b/i.test(hit.line.text) ? 'high' : 'medium', hit.line, hit.match[0]);
+const DATE_TOKEN = `(\\d{2}\\s*[/-]\\s*\\d{4}|${MONTH_RE}\\.?\\s+\\d{4}|\\d{2}\\s*[/-]\\s*\\d{2})`;
+
+function tokenFuzzy(token: string, label: string): boolean {
+  const a = token.replace(/[^A-Z]/g, '');
+  const b = label.replace(/[^A-Z]/g, '');
+  if (!a || a.length < 2) return false;
+  if (a === b) return true;
+  if (b.startsWith(a) && a.length >= b.length - 1) return true;
+  return editDistance(a, b) <= 1;
 }
 
-function extractMfgDate(lines: TextLine[]): ExtractionField | null {
-  // (MFG|MFD|Mfg.?\s*Date)\s*[:.\-]?\s*(\d{2}[\/\-]\d{4}|[A-Za-z]{3}\.?\s*\d{2,4})
-  const hit = matchLine(
-    lines,
-    new RegExp(
-      `\\b(?:MFG|MFD|MFGD|Mfg\\.?\\s*Date|Mfd\\.?\\s*Date|Mfgd)\\b\\s*[:.]?\\s*-?\\s*(\\d{2}\\s*[/-]\\s*\\d{4}|\\d{2}\\s*[/-]\\s*\\d{2}|${MONTH_RE}\\.?\\s*[-/ ]\\s*\\d{2,4})`,
-      'i'
-    )
-  );
-  if (!hit) return null;
-  return field(normalizeDate(hit.match[1]), 'high', hit.line, hit.match[0]);
+function isExpLabel(token: string): boolean {
+  const t = token.replace(/[^A-Z]/g, '');
+  return ['EXP', 'EXPIRY', 'EXPDATE', 'USEBY', 'BESTBEFORE'].some(l => tokenFuzzy(token, l)) || /^E?XP$/.test(t);
 }
 
-function extractExpiry(lines: TextLine[]): ExtractionField | null {
-  // (EXP|Expiry)\s*[:.\-]?\s*(\d{2}[\/\-]\d{4}|[A-Za-z]{3}\.?\s*\d{2,4})
-  const hit = matchLine(
-    lines,
-    new RegExp(
-      `\\b(?:EXP|Expiry|Exp\\.?\\s*Date|EXP\\s*Date|Use\\s*By|Best\\s*Before)\\b\\s*[:.]?\\s*-?\\s*(\\d{2}\\s*[/-]\\s*\\d{4}|\\d{2}\\s*[/-]\\s*\\d{2}|${MONTH_RE}\\.?\\s*[-/ ]\\s*\\d{2,4})`,
-      'i'
-    )
-  );
-  if (!hit) return null;
-  return field(normalizeDate(hit.match[1]), 'high', hit.line, hit.match[0]);
+function isMfgLabel(token: string): boolean {
+  return ['MFG', 'MFD', 'MFGDATE', 'MFDDATE', 'MFGD'].some(l => tokenFuzzy(token, l));
 }
 
-function extractMrp(lines: TextLine[]): ExtractionField | null {
-  // M\.?R\.?P\.?\s*[:.\-]?\s*(?:Rs\.?)?\s*([\d.]+)
-  const hit = matchLine(lines, /\bM\.?\s?R\.?\s?P\.?\s*[:.]?\s*-?\s*(?:Rs\.?|INR|₹)?\s*([0-9]+(?:[.,][0-9]{1,2})?)/i);
-  if (!hit) return null;
-  const value = `₹${hit.match[1].replace(',', '.')}`;
-  return field(value, 'high', hit.line, hit.match[0]);
+function dateAmbiguous(raw: string): string | undefined {
+  if (/[68]/.test(raw) && /[OQGDSBilI|]/.test(raw)) return 'A digit may be 6 or 8 — please confirm.';
+  return undefined;
+}
+
+interface LabeledHit {
+  field: ExtractionField;
+  quality: MatchQuality;
+}
+
+function searchLabeledDate(lines: TextLine[], kind: 'exp' | 'mfg'): LabeledHit | null {
+  for (const line of lines) {
+    const repaired = repairLabelConfusions(line.text);
+    const re = new RegExp(`\\b([A-Z]{2,12})\\.?\\s*[:.\\-]*\\s*${DATE_TOKEN}`, 'g');
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(repaired))) {
+      const label = m[1];
+      const ok = kind === 'exp' ? isExpLabel(label) : isMfgLabel(label);
+      if (!ok) continue;
+      const compact = label.replace(/[^A-Z]/g, '');
+      const fuzzy = kind === 'exp' ? !['EXP', 'EXPIRY', 'EXPDATE'].includes(compact) : !['MFG', 'MFD', 'MFGDATE', 'MFDDATE', 'MFGD'].includes(compact);
+      const hint = dateAmbiguous(m[0] + line.text);
+      return {
+        quality: fuzzy ? 'fuzzy' : 'strict',
+        field: field(normalizeDate(m[2]), fuzzy || line.confidence === 'low' ? 'low' : 'high', line, m[0], {
+          matchQuality: fuzzy ? 'fuzzy' : 'strict',
+          ambiguous: Boolean(hint),
+          ambiguousHint: hint,
+        }),
+      };
+    }
+  }
+  return null;
+}
+
+function extractBatch(lines: TextLine[]): LabeledHit | null {
+  for (const line of lines) {
+    const repaired = repairLabelConfusions(line.text);
+    const hit = repaired.match(/\b(B\.?\s*NO|BATCH(?:\s*NO)?|LOT(?:\s*NO)?)\b\s*[:.\-]*\s*([A-Z0-9][A-Z0-9-]{4,11})\b/);
+    if (!hit) continue;
+    const value = hit[2].toUpperCase().replace(/[^A-Z0-9-]/g, '');
+    if (value.length < 5 || value.length > 12) continue;
+    const lab = hit[1].replace(/[^A-Z]/g, '');
+    const fuzzy = !['BATCH', 'BATCHNO', 'BNO', 'LOT', 'LOTNO'].includes(lab);
+    return {
+      quality: fuzzy ? 'fuzzy' : 'strict',
+      field: field(value, fuzzy || line.confidence === 'low' ? 'low' : 'high', line, hit[0], {
+        matchQuality: fuzzy ? 'fuzzy' : 'strict',
+      }),
+    };
+  }
+  return null;
+}
+
+function extractMfgDate(lines: TextLine[]): LabeledHit | null {
+  return searchLabeledDate(lines, 'mfg');
+}
+
+function extractExpiry(lines: TextLine[]): LabeledHit | null {
+  return searchLabeledDate(lines, 'exp');
+}
+
+function extractMrp(lines: TextLine[]): LabeledHit | null {
+  for (const line of lines) {
+    const repaired = repairLabelConfusions(line.text);
+    const hit = repaired.match(/\b(M\.?R\.?P)\.?\s*[:.\-]*\s*(?:RS\.?|INR|₹)?\s*(\d+[.,]\d{1,2})\b/);
+    if (!hit) continue;
+    const amount = hit[2].replace(',', '.');
+    const fuzzy = hit[1].replace(/[^A-Z]/g, '') !== 'MRP';
+    return {
+      quality: fuzzy ? 'fuzzy' : 'strict',
+      field: field(`₹${amount}`, fuzzy || line.confidence === 'low' ? 'low' : 'high', line, hit[0], {
+        matchQuality: fuzzy ? 'fuzzy' : 'strict',
+      }),
+    };
+  }
+  return null;
+}
+
+function unlabeledDates(lines: TextLine[]): { mfg: LabeledHit; exp: LabeledHit } | null {
+  const found: Array<{ value: string; line: TextLine; raw: string }> = [];
+  for (const line of lines) {
+    const repaired = repairLabelConfusions(line.text);
+    const re = new RegExp(DATE_TOKEN, 'g');
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(repaired))) {
+      const value = normalizeDate(m[1] ?? m[0]);
+      if (!/^\d{2}\/\d{4}$/.test(value)) continue;
+      if (!found.some(f => f.value === value)) found.push({ value, line, raw: m[0] });
+    }
+  }
+  if (found.length < 2) return null;
+  const sorted = [...found].sort((a, b) => {
+    const [am, ay] = a.value.split('/').map(Number);
+    const [bm, by] = b.value.split('/').map(Number);
+    return ay * 12 + am - (by * 12 + bm);
+  });
+  const earlier = sorted[0];
+  const later = sorted[sorted.length - 1];
+  if (earlier.value === later.value) return null;
+  const hint = dateAmbiguous(earlier.raw + later.raw);
+  return {
+    mfg: {
+      quality: 'unlabeled',
+      field: field(earlier.value, 'low', earlier.line, earlier.raw, {
+        matchQuality: 'unlabeled',
+        ambiguous: Boolean(hint),
+        ambiguousHint: hint,
+      }),
+    },
+    exp: {
+      quality: 'unlabeled',
+      field: field(later.value, 'low', later.line, later.raw, {
+        matchQuality: 'unlabeled',
+        ambiguous: Boolean(hint),
+        ambiguousHint: hint,
+      }),
+    },
+  };
+}
+
+function hitToCandidate(key: FieldKey, hit: LabeledHit, reason: FieldCandidate['reason']): FieldCandidate {
+  return {
+    key,
+    value: hit.field.value,
+    matchedText: hit.field.provenance?.matchedText ?? hit.field.value,
+    bbox: hit.field.provenance?.bbox,
+    confidence: hit.field.confidence,
+    reason,
+    ambiguousHint: hit.field.ambiguousHint,
+  };
+}
+
+function placeHit(
+  fields: ExtractedFields,
+  candidates: FieldCandidate[],
+  key: FieldKey,
+  hit: LabeledHit | null
+): void {
+  if (!hit) return;
+
+  // A strict, high-confidence, unambiguous hit goes directly into fields — no confirm needed.
+  if (hit.quality === 'strict' && hit.field.confidence !== 'low' && !hit.field.ambiguous) {
+    console.log(`[placeHit] ${key} → fields (strict/high)`, hit.field.value);
+    fields[key] = hit.field;
+    return;
+  }
+
+  // Determine the correct reason for the confirm step.
+  const reason: FieldCandidate['reason'] = hit.field.ambiguous
+    ? 'ambiguous-digit'
+    : hit.quality === 'unlabeled'
+      ? 'unlabeled'
+      : hit.quality === 'fuzzy'
+        ? 'fuzzy'
+        : 'low-confidence'; // strict but low confidence
+
+  console.log(`[placeHit] ${key} → candidates (${reason})`, hit.field.value);
+  candidates.push(hitToCandidate(key, hit, reason));
 }
 
 function extractLicense(lines: TextLine[]): ExtractionField | null {
@@ -263,39 +413,135 @@ function extractPillImprint(lines: TextLine[]): ExtractionField | null {
 
 export function extractFields(lines: TextLine[], blurScore: number, codes: DecodedCode[] = []): ExtractedData {
   const keywordHits = countMedicineKeywords(lines);
-  // 3+ keyword hits = medicine pack; 0-2 = inconclusive → "review", never "fail".
   const usable = keywordHits >= 3;
   const fields = emptyFields();
+  const candidates: FieldCandidate[] = [];
 
-  if (usable) {
-    fields.batch_no = extractBatch(lines);
-    fields.mfg_date = extractMfgDate(lines);
-    fields.expiry_date = extractExpiry(lines);
-    fields.mrp = extractMrp(lines);
-    fields.manufacturing_license_no = extractLicense(lines);
-    fields.schedule_marking = extractSchedule(lines);
-    fields.dosage_form = extractDosageForm(lines);
-    fields.composition = extractComposition(lines);
-    const { manufacturer, marketer } = extractManufacturerAndMarketer(lines);
-    fields.manufacturer_name = manufacturer;
-    fields.marketer_name = marketer;
-    fields.brand_name = extractBrand(lines);
-    fields.pill_imprint = extractPillImprint(lines);
+  placeHit(fields, candidates, 'batch_no', extractBatch(lines));
+  placeHit(fields, candidates, 'mfg_date', extractMfgDate(lines));
+  placeHit(fields, candidates, 'expiry_date', extractExpiry(lines));
+  placeHit(fields, candidates, 'mrp', extractMrp(lines));
+  if (!fields.mfg_date && !fields.expiry_date && !candidates.some(c => c.key === 'mfg_date' || c.key === 'expiry_date')) {
+    const pair = unlabeledDates(lines);
+    if (pair) {
+      placeHit(fields, candidates, 'mfg_date', pair.mfg);
+      placeHit(fields, candidates, 'expiry_date', pair.exp);
+    }
   }
 
-  tagSourceFields(lines, fields);
+  fields.manufacturing_license_no = extractLicense(lines);
+  fields.schedule_marking = extractSchedule(lines);
+  fields.dosage_form = extractDosageForm(lines);
+  fields.composition = extractComposition(lines);
+  const { manufacturer, marketer } = extractManufacturerAndMarketer(lines);
+  fields.manufacturer_name = manufacturer;
+  fields.marketer_name = marketer;
+  fields.brand_name = extractBrand(lines);
+  fields.pill_imprint = extractPillImprint(lines);
 
-  return {
+  tagSourceFields(lines, fields);
+  const grounded = groundExtractedData({
     usable,
     rejectReason: usable
       ? undefined
       : `Could not read enough text — only ${keywordHits} medicine keyword${keywordHits === 1 ? '' : 's'} found.`,
     keywordHits,
     fields,
+    candidates,
     rawTextLines: lines,
+    allOcrLines: lines,   // pipeline overrides this with the full unfiltered set after the call
     unreadableRegions: findUnreadableRegions(lines),
     blurScore,
     codes,
+  });
+
+  console.log(
+    'PARSED fields:',
+    Object.fromEntries((Object.keys(grounded.fields) as FieldKey[]).map(k => [k, grounded.fields[k]?.value ?? null]))
+  );
+  console.log(
+    'PARSED candidates:',
+    grounded.candidates.map(c => `${c.key}=${c.value} (${c.reason})`)
+  );
+
+  return grounded;
+}
+
+/** Drop values that do not appear in raw lines; demote $ prices on Indian packs. */
+export function groundExtractedData(data: ExtractedData): ExtractedData {
+  const lines = data.rawTextLines;
+  const raw = lines.map(l => l.text).join('\n');
+  const fields = { ...data.fields };
+  const candidates = [...data.candidates];
+
+  for (const key of Object.keys(fields) as FieldKey[]) {
+    const current = fields[key];
+    if (!current) continue;
+    if (current.origin === 'user') continue;
+    const source = current.provenance?.matchedText && fuzzyContains(raw, current.provenance.matchedText)
+      ? current.provenance.matchedText
+      : findSourceLine(current.value, lines);
+    if (!source) {
+      console.log('ungrounded value removed', key, current.value);
+      fields[key] = null;
+      continue;
+    }
+    current.grounded = true;
+    current.provenance = {
+      ...current.provenance,
+      matchedText: current.provenance?.matchedText ?? cleanLine(source),
+    };
+    if (hasDollarPrice(current.value) && looksIndianPack(raw)) {
+      console.log('currency mismatch sent to confirm', key, current.value);
+      candidates.push({
+        key,
+        value: current.value,
+        matchedText: current.provenance.matchedText ?? source,
+        bbox: current.provenance.bbox,
+        confidence: 'low',
+        reason: 'currency',
+        ambiguousHint: 'This pack looks Indian (₹ / Rs / Mfg. Lic.) but the price used $.',
+      });
+      fields[key] = null;
+    }
+  }
+
+  return { ...data, fields, candidates };
+}
+
+const CONF_RANK: Record<string, number> = { high: 4, medium: 3, low: 2, user: 1 };
+
+export function mergeExtractedData(base: ExtractedData, incoming: ExtractedData): ExtractedData {
+  const fields = { ...base.fields };
+  for (const key of Object.keys(fields) as FieldKey[]) {
+    const next = incoming.fields[key];
+    if (!next) continue;
+    const cur = fields[key];
+    if (!cur) {
+      fields[key] = next;
+      continue;
+    }
+    const rank = (f: ExtractionField) => (f.origin === 'user' ? 1 : CONF_RANK[f.confidence] ?? 0);
+    if (rank(next) > rank(cur)) fields[key] = next;
+  }
+  const seen = new Set(base.candidates.map(c => `${c.key}:${c.value}`));
+  const candidates = [...base.candidates];
+  for (const c of incoming.candidates) {
+    const id = `${c.key}:${c.value}`;
+    if (seen.has(id) || fields[c.key]?.value === c.value) continue;
+    seen.add(id);
+    candidates.push(c);
+  }
+  return {
+    ...base,
+    usable: base.usable || incoming.usable,
+    keywordHits: Math.max(base.keywordHits, incoming.keywordHits),
+    fields,
+    candidates,
+    rawTextLines: [...base.rawTextLines, ...incoming.rawTextLines],
+    allOcrLines: [...(base.allOcrLines ?? []), ...(incoming.allOcrLines ?? [])],
+    unreadableRegions: [...base.unreadableRegions, ...incoming.unreadableRegions],
+    codes: incoming.codes.length > 0 ? incoming.codes : base.codes,
   };
 }
 

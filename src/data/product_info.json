@@ -1,0 +1,104 @@
+[
+  {
+    "id": "immutil-500",
+    "brand": "Immutil 500",
+    "brandKeywords": ["immutil", "immutil 500", "immutil500"],
+    "dosageForm": "Film coated tablet",
+    "drugClass": "Immunosuppressant (transplant medicine)",
+    "ingredients": [
+      { "name": "Mycophenolate Mofetil IP", "keywords": ["mycophenolate", "mofetil", "mycophenol"], "strengthMg": 500 }
+    ],
+    "manufacturerKeywords": ["ravian", "la renon", "larenon", "renon"],
+    "manufacturerDisplay": "Marketed by La Renon Healthcare Pvt. Ltd.; manufactured by Ravian Life Science Pvt. Ltd., Haridwar",
+    "licenseNo": "82/UA/2007",
+    "uses": "Used with other medicines to help prevent the body from rejecting a transplanted organ (such as kidney, heart or liver).",
+    "sideEffects": [
+      "Diarrhoea, nausea, vomiting, stomach pain",
+      "Headache, tiredness",
+      "Higher chance of infections",
+      "Low blood cell counts"
+    ],
+    "warnings": [
+      "Can cause pregnancy loss and birth defects. Needs reliable contraception under a doctor's guidance.",
+      "Raises the risk of serious infections and some cancers (for example skin cancer and lymphoma).",
+      "Take only exactly as prescribed by the transplant team."
+    ]
+  },
+  {
+    "id": "amlokind-at",
+    "brand": "Amlokind AT",
+    "brandKeywords": ["amlokind", "amlok", "mlokind", "amlokind at", "amlokind-at"],
+    "dosageForm": "Uncoated tablet",
+    "drugClass": "Blood pressure medicine (calcium channel blocker + beta blocker)",
+    "ingredients": [
+      { "name": "Amlodipine (as Amlodipine Besilate IP)", "keywords": ["amlodipine", "amlodip", "besilate", "besylate"], "strengthMg": 5 },
+      { "name": "Atenolol IP", "keywords": ["atenolol", "atenol"], "strengthMg": 50 }
+    ],
+    "manufacturerKeywords": ["mankind", "mankind pharma", "m/743", "m743"],
+    "manufacturerDisplay": "Mankind Pharma Ltd. (Mfg. Lic. No. M/743/2016)",
+    "licenseNo": "M/743/2016",
+    "uses": "Used to treat high blood pressure, usually when one medicine alone is not enough.",
+    "sideEffects": [
+      "Dizziness, tiredness, headache",
+      "Swelling of ankles or feet",
+      "Slow heartbeat, cold hands and feet",
+      "Flushing"
+    ],
+    "warnings": [
+      "Do not stop suddenly. Stopping atenolol abruptly can be harmful.",
+      "Atenolol can hide warning signs of low blood sugar in people with diabetes.",
+      "Tell your doctor if you have asthma, heart failure or very slow pulse."
+    ]
+  },
+  {
+    "id": "glimiprime-m3-forte",
+    "brand": "Glimiprime-M3 Forte",
+    "brandKeywords": ["glimiprime", "glimiprim", "glimiprime m3", "glimiprime-m3"],
+    "dosageForm": "Uncoated bilayered tablet (metformin in prolonged-release form)",
+    "drugClass": "Diabetes medicine (biguanide + sulfonylurea)",
+    "ingredients": [
+      { "name": "Metformin Hydrochloride IP (prolonged release)", "keywords": ["metformin", "metformin hydrochloride"], "strengthMg": 1000 },
+      { "name": "Glimepiride IP", "keywords": ["glimepiride", "glimepir"], "strengthMg": 3 }
+    ],
+    "manufacturerKeywords": ["primus", "primus remedies"],
+    "manufacturerDisplay": "Marketed by Primus Remedies Pvt. Ltd.",
+    "licenseNo": null,
+    "uses": "Used to control blood sugar in adults with type 2 diabetes, together with diet and exercise.",
+    "sideEffects": [
+      "Nausea, diarrhoea, stomach upset, metallic taste",
+      "Low blood sugar (sweating, shaking, hunger, confusion)",
+      "Dizziness, weight gain"
+    ],
+    "warnings": [
+      "Low blood sugar can be serious. Keep a fast-acting sugar source nearby and do not skip meals.",
+      "Rarely, metformin causes lactic acidosis. Seek urgent help for unusual weakness, fast breathing or severe stomach pain.",
+      "Limit alcohol and tell your doctor before scans with contrast dye or surgery."
+    ]
+  },
+  {
+    "id": "coldrelief-plus-mock",
+    "brand": "ColdRelief-Plus",
+    "brandKeywords": ["coldrelief", "cold relief", "coldrelief plus", "cold relief plus"],
+    "dosageForm": "Film coated tablet",
+    "drugClass": "Cold and allergy symptom relief (pain/fever reducer + antihistamine + decongestant)",
+    "ingredients": [
+      { "name": "Paracetamol IP", "keywords": ["paracetamol", "acetaminophen"], "strengthMg": 500 },
+      { "name": "Chlorpheniramine Maleate IP", "keywords": ["chlorpheniramine", "chlorphenir", "chlorpheniram"], "strengthMg": 2 },
+      { "name": "Phenylephrine Hydrochloride IP", "keywords": ["phenylephrine", "phenyleph"], "strengthMg": 5 }
+    ],
+    "manufacturerKeywords": ["sunrise", "sunrise pharmaceuticals"],
+    "manufacturerDisplay": "Sunrise Pharmaceuticals Pvt. Ltd., Baddi",
+    "licenseNo": null,
+    "uses": "Used for short-term relief of cold and flu symptoms such as fever, headache, runny nose, sneezing and blocked nose.",
+    "sideEffects": [
+      "Drowsiness, dry mouth, dizziness",
+      "Nervousness or trouble sleeping",
+      "Raised blood pressure or fast heartbeat (from the decongestant)"
+    ],
+    "warnings": [
+      "Do not take other paracetamol products at the same time. Too much paracetamol can damage the liver.",
+      "Can cause drowsiness. Avoid driving.",
+      "People with high blood pressure or heart disease should ask a doctor first."
+    ]
+  }
+]

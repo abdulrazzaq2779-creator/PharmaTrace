@@ -5,11 +5,13 @@ import { Card } from '../components/Card';
 import { Badge } from '../components/Badge';
 import { Input } from '../components/Input';
 import type { MissingGroup } from '../hooks/useScanSession';
-import type { FieldKey, SessionPhoto } from '../types';
+import type { FieldCandidate, FieldKey, SessionPhoto } from '../types';
 import { FIELD_LABELS } from '../data/content';
 
 interface CollectScreenProps {
   groups: MissingGroup[];
+  /** Candidates parsed from the first scan that need user confirmation. */
+  candidates: FieldCandidate[];
   /** How many key details exist (denominator of the progress bar). */
   totalDetails: number;
   /** How many key details are collected so far. */
@@ -18,6 +20,8 @@ interface CollectScreenProps {
   error: string | null;
   onCapture: (file: File, stepId: string) => void;
   onEnterManually: (key: FieldKey, value: string) => void;
+  /** Promote a candidate (possibly with an edited value) to a confirmed field. */
+  onConfirmCandidate: (key: FieldKey, value: string) => void;
   onSkip: (stepId: string) => void;
   onFinish: () => void;
   canFinish: boolean;
@@ -27,14 +31,106 @@ function fieldLabel(key: FieldKey): string {
   return FIELD_LABELS.find(entry => entry.key === key)?.label ?? key;
 }
 
+function reasonLabel(reason: FieldCandidate['reason']): string {
+  switch (reason) {
+    case 'fuzzy': return 'Fuzzy label match';
+    case 'low-confidence': return 'Low-confidence read';
+    case 'unlabeled': return 'No label found — guessed from position';
+    case 'ambiguous-digit': return 'Digit may be misread';
+    case 'currency': return 'Currency looks wrong for this pack';
+    default: return 'Needs confirmation';
+  }
+}
+
+/** The "Confirm what we read" panel shown before collection steps. */
+function ConfirmCandidatesPanel({
+  candidates,
+  onConfirm,
+}: {
+  candidates: FieldCandidate[];
+  onConfirm: (key: FieldKey, value: string) => void;
+}) {
+  const [edits, setEdits] = useState<Record<string, string>>(() =>
+    Object.fromEntries(candidates.map(c => [c.key, c.value]))
+  );
+  const [confirmed, setConfirmed] = useState<Set<string>>(new Set());
+
+  if (candidates.length === 0) return null;
+
+  return (
+    <Card variant="elevated" padding="md" className="mb-4 animate-slide-up">
+      <div className="flex items-center gap-2 mb-3">
+        <CircleAlert size={18} className="text-warning-500" aria-hidden="true" />
+        <h2 className="font-semibold text-gray-900">Confirm what we read</h2>
+      </div>
+      <p className="text-sm text-gray-500 mb-4">
+        These values were found but need your confirmation. Edit if needed, then tap Confirm.
+      </p>
+      <div className="space-y-4">
+        {candidates.map(candidate => {
+          const done = confirmed.has(candidate.key);
+          return (
+            <div key={candidate.key} className={`rounded-xl p-3 border ${done ? 'bg-success-50 border-success-200' : 'bg-amber-50 border-amber-200'}`}>
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-xs font-semibold text-gray-700 uppercase tracking-wide">
+                  {fieldLabel(candidate.key)}
+                </span>
+                <Badge variant={done ? 'success' : 'warning'} size="sm">
+                  {done ? 'Confirmed' : reasonLabel(candidate.reason)}
+                </Badge>
+              </div>
+              {candidate.ambiguousHint && (
+                <p className="text-xs text-amber-700 mb-1">⚠ {candidate.ambiguousHint}</p>
+              )}
+              <p className="text-xs text-gray-500 mb-2">
+                We read: <span className="font-mono text-gray-700">{candidate.matchedText}</span>
+              </p>
+              {done ? (
+                <p className="text-sm font-medium text-success-700">
+                  ✓ Saved as: {edits[candidate.key] ?? candidate.value}
+                </p>
+              ) : (
+                <div className="flex items-end gap-2 mt-2">
+                  <Input
+                    label={`Edit ${fieldLabel(candidate.key)}`}
+                    value={edits[candidate.key] ?? candidate.value}
+                    onChange={e => setEdits(prev => ({ ...prev, [candidate.key]: e.target.value }))}
+                    placeholder={candidate.value}
+                  />
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    onClick={() => {
+                      const value = (edits[candidate.key] ?? candidate.value).trim();
+                      if (value) {
+                        onConfirm(candidate.key, value);
+                        setConfirmed(prev => new Set([...prev, candidate.key]));
+                      }
+                    }}
+                  >
+                    <Check size={16} />
+                    Confirm
+                  </Button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </Card>
+  );
+}
+
 export function CollectScreen({
   groups,
+  candidates,
   totalDetails,
   collectedDetails,
   photos,
   error,
   onCapture,
   onEnterManually,
+  onConfirmCandidate,
   onSkip,
   onFinish,
   canFinish,
@@ -45,6 +141,15 @@ export function CollectScreen({
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const activeGroup = groups.find(g => g.stepId === activeStepId) ?? groups[0] ?? null;
+
+  console.log('COLLECT SCREEN fields:', {
+    collectedDetails,
+    totalDetails,
+    pendingGroupCount: groups.length,
+    pendingGroups: groups.map(g => `${g.stepId}: missing=[${g.missing.join(',')}]`),
+    candidateCount: candidates.length,
+    candidates: candidates.map(c => `${c.key}=${c.value}(${c.reason})`),
+  });
 
   const handleCaptureClick = useCallback(() => {
     fileInputRef.current?.click();
@@ -81,6 +186,14 @@ export function CollectScreen({
           <div className="mb-4 p-3 rounded-xl bg-danger-50 border border-danger-200 text-sm text-danger-700" role="alert">
             {error}
           </div>
+        )}
+
+        {/* ── Step 0: Confirm candidates from the first scan ── */}
+        {candidates.length > 0 && (
+          <ConfirmCandidatesPanel
+            candidates={candidates}
+            onConfirm={onConfirmCandidate}
+          />
         )}
 
         {activeGroup ? (

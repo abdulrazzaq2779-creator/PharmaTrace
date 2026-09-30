@@ -10,18 +10,12 @@ import { useScanSession } from './hooks/useScanSession';
 import { useAppSettings } from './hooks/useAppSettings';
 import { useScanHistory } from './hooks/useScan';
 import { buildReportText } from './utils/report';
-import type { CaptureSource, FieldKey, ScanResult, Screen } from './types';
+import type { CaptureSource, ScanResult, Screen } from './types';
+import { fieldCountsAsCollected, KEY_DETAIL_KEYS } from './types';
 
 /** The key details the progress indicator counts. */
-const KEY_DETAILS: FieldKey[] = [
-  'brand_name',
-  'composition',
-  'manufacturer_name',
-  'batch_no',
-  'mfg_date',
-  'expiry_date',
-  'mrp',
-];
+// KEY_DETAIL_KEYS is imported from types — brand, composition, manufacturer,
+// batch, MFG, EXP, MRP.  Using the canonical list avoids drift.
 
 const TABS = [
   { id: 'scan', icon: Camera, label: 'Scan' },
@@ -78,6 +72,7 @@ async function shareOrCopy(report: string, title: string): Promise<'shared' | 'c
 function App() {
   const [currentScreen, setCurrentScreen] = useState<Screen>('scan');
   const [finalResult, setFinalResult] = useState<ScanResult | null>(null);
+  const [navError, setNavError] = useState<string | null>(null);
   const session = useScanSession();
   const { scanResults, historyError, upsertScan, deleteScan, clearHistory } = useScanHistory();
   const { settings, updateSetting, resetSettings } = useAppSettings();
@@ -86,16 +81,33 @@ function App() {
 
   const handleScanComplete = useCallback(
     async (file: File, source: CaptureSource) => {
-      // startScan returns the outcome; reading session.stage here would be stale.
-      const outcome = await session.startScan(file, source);
-      if (outcome) {
+      setNavError(null);
+      try {
+        console.log('[App] handleScanComplete — starting scan', file.name, source);
+        const outcome = await session.startScan(file, source);
+        console.log('[App] startScan resolved', outcome ? { stage: outcome.stage, hasFinal: !!outcome.final } : null);
+        if (!outcome) {
+          // startScan already set session.error; user sees scan-screen error.
+          console.warn('[App] startScan returned null — session error set');
+          return;
+        }
         if (outcome.stage === 'done' && outcome.final) {
-          setFinalResult(outcome.final);
-          upsertScan(outcome.final);
-          setCurrentScreen('results');
+          try {
+            setFinalResult(outcome.final);
+            upsertScan(outcome.final);
+            console.log('[App] navigating to results (done path)');
+            setCurrentScreen('results');
+          } catch (navErr) {
+            console.error('[App] result navigation failed (done path)', navErr);
+            setNavError('Analysis finished but the result could not be built. Tap "Show debug" for details.');
+          }
         } else {
+          console.log('[App] navigating to collect, pendingGroups', session.pendingGroups.length);
           setCurrentScreen('collect');
         }
+      } catch (err) {
+        console.error('[App] handleScanComplete threw unexpectedly', err);
+        setNavError('Analysis finished but the result could not be built.');
       }
     },
     [session, upsertScan]
@@ -109,12 +121,22 @@ function App() {
   );
 
   const handleFinish = useCallback(() => {
-    const result = session.finish();
-    if (result) {
-      setFinalResult(result);
-      // Every completed scan lands in history automatically (deduped on save).
-      upsertScan(result);
-      setCurrentScreen('results');
+    setNavError(null);
+    try {
+      console.log('[App] handleFinish — assembling result');
+      const result = session.finish();
+      if (result) {
+        setFinalResult(result);
+        upsertScan(result);
+        console.log('[App] navigating to results (finish path)');
+        setCurrentScreen('results');
+      } else {
+        console.error('[App] finish() returned null — no firstPass?');
+        setNavError('Could not build the result. Please start a new scan.');
+      }
+    } catch (err) {
+      console.error('[App] handleFinish threw', err);
+      setNavError('Analysis finished but the result could not be built.');
     }
   }, [session, upsertScan]);
 
@@ -137,6 +159,7 @@ function App() {
   const handleNewScan = useCallback(() => {
     session.reset();
     setFinalResult(null);
+    setNavError(null);
     setCurrentScreen('scan');
   }, [session]);
 
@@ -145,12 +168,25 @@ function App() {
     return shareOrCopy(buildReportText(scan), `PharmaTrace Scan: ${brand}`);
   }, []);
 
-  const collectedDetails = KEY_DETAILS.filter(key => session.fields[key]).length;
+  // A key is "collected" if it has a confirmed/grounded field OR a pending candidate to confirm.
+  const candidates = session.firstPass?.data.candidates ?? [];
+  const candidateKeys = new Set(candidates.map(c => c.key));
+  const collectedDetails = KEY_DETAIL_KEYS.filter(
+    key => fieldCountsAsCollected(session.fields[key]) || candidateKeys.has(key)
+  ).length;
 
   return (
     <ErrorBoundary>
       <div className="min-h-screen bg-gray-50">
         <main className="pb-20">
+          {navError && (
+            <div className="fixed inset-x-0 top-0 z-50 bg-danger-600 text-white text-sm px-4 py-3 flex items-center justify-between" role="alert">
+              <span>{navError}</span>
+              <button className="ml-4 underline" onClick={() => { console.log('[debug] session firstPass', session.firstPass); console.log('[debug] fields', session.fields); setNavError(null); }}>
+                Show debug
+              </button>
+            </div>
+          )}
           {currentScreen === 'scan' && (
             <ScanScreen
               onScanComplete={handleScanComplete}
@@ -163,12 +199,14 @@ function App() {
           {currentScreen === 'collect' && (
             <CollectScreen
               groups={session.pendingGroups}
-              totalDetails={KEY_DETAILS.length}
+              candidates={session.firstPass?.data.candidates ?? []}
+              totalDetails={KEY_DETAIL_KEYS.length}
               collectedDetails={collectedDetails}
               photos={session.photos}
               error={session.error}
               onCapture={handleCaptureStep}
               onEnterManually={session.enterManually}
+              onConfirmCandidate={session.confirmCandidate}
               onSkip={session.skipStep}
               onFinish={handleFinish}
               canFinish={!analyzing}

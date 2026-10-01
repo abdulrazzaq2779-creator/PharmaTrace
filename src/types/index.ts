@@ -25,6 +25,8 @@ export interface ExtractionField {
   /** 'image' = read from a photo; 'user' = typed manually (lower-confidence evidence). */
   origin: FieldOrigin;
   provenance?: FieldProvenance;
+  /** Value came from the matched reference record, not from OCR on the image. */
+  fromReference?: boolean;
   /** True when the value fuzzy-matches a raw OCR/vision line. */
   grounded?: boolean;
   /** User accepted a candidate (or typed a correction). */
@@ -141,6 +143,33 @@ export interface BatchInfoResult {
   formatCheck: { status: 'pass' | 'fail' | 'unknown'; detail: string } | null;
 }
 
+/**
+ * Output of the verify.js engine for one scan. The whole results screen is
+ * driven by this object: label, confidence, counts and the checks list.
+ */
+export interface Verification {
+  /** Human verdict headline, e.g. "Needs Review". */
+  label: string;
+  confidence: 'high' | 'medium' | 'low';
+  riskLevel: RiskLevel;
+  counts: { passed: number; failed: number; review: number; unavailable: number };
+  checks: Array<{ name: string; status: 'pass' | 'fail' | 'review' | 'unavailable'; reason: string }>;
+  /** Reference-record info for the matched product (About this medicine). */
+  fromReference: {
+    brand: string;
+    composition: string;
+    dosageForm: string;
+    drugClass: string;
+    manufacturer: string;
+    licenseNo: string | null;
+    uses: string;
+    sideEffects: string[];
+    warnings: string[];
+    disclaimer: string;
+  } | null;
+  rawTextLength: number;
+}
+
 /** Full medicine information from the product_info dataset. */
 export interface ProductIngredient {
   name: string;
@@ -151,9 +180,13 @@ export interface ProductIngredient {
 export interface ProductInfo {
   id: string;
   brand: string;
+  /** Extra brand spellings to search raw OCR text for (data-driven). */
+  brandKeywords?: string[];
   dosageForm: string;
   drugClass: string;
   ingredients: ProductIngredient[];
+  /** Manufacturer spellings to search raw OCR text for (data-driven). */
+  manufacturerKeywords?: string[];
   manufacturerDisplay: string;
   licenseNo: string | null;
   uses: string;
@@ -170,6 +203,8 @@ export interface ExtractedData {
   fields: ExtractedFields;
   /** Parsed values that need the user to confirm, edit, or retake. */
   candidates: FieldCandidate[];
+  /** Every recognized line from ALL passes/bands/crops/rotations, joined. */
+  rawText: string;
   rawTextLines: TextLine[];
   /** ALL OCR lines including low-confidence — used only for dataset keyword matching. */
   allOcrLines: TextLine[];
@@ -244,6 +279,8 @@ export interface ScanResult {
   batchInfo: BatchInfoResult | null;
   /** Full medicine info from product_info.json, when the product was matched. */
   productInfo: ProductInfo | null;
+  /** verify.js output — drives the results screen verdict, counts and checks. */
+  verification: Verification;
 }
 
 export type Screen = 'scan' | 'results' | 'history' | 'settings' | 'collect';

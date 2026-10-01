@@ -20,9 +20,9 @@ import { Card } from '../components/Card';
 import { Badge } from '../components/Badge';
 import { Modal } from '../components/Modal';
 import { Input } from '../components/Input';
-import type { BBox, CheckResult, DecodedCode, FieldKey, ProductInfo, RiskLevel, ScanResult, SessionPhoto, TextLine } from '../types';
+import type { BBox, CheckResult, DecodedCode, FieldKey, ProductInfo, RiskLevel, ScanResult, SessionPhoto, TextLine, Verification } from '../types';
 import { BLOCKING_KEYS } from '../types';
-import { FIELD_LABELS, riskLevelDescriptions, riskLevelLabels } from '../data/content';
+import { FIELD_LABELS, riskLevelDescriptions } from '../data/content';
 import { buildReportText } from '../utils/report';
 import { formatDate, getRiskLevelColor } from '../utils/helpers';
 import { applyManualEntry } from '../utils/resultEdits';
@@ -115,15 +115,9 @@ export function ResultsScreen({
   const riskColorClasses = getRiskLevelColor(scanResult.riskLevel);
   const [riskTextColor, riskBgColor, riskBorderColor] = riskColorClasses.split(' ');
 
-  const counts = useMemo(
-    () => ({
-      passed: scanResult.checks.filter(c => c.status === 'pass').length,
-      failed: scanResult.checks.filter(c => c.status === 'fail').length,
-      review: scanResult.checks.filter(c => c.status === 'review').length,
-      unavailable: scanResult.checks.filter(c => c.status === 'unavailable').length,
-    }),
-    [scanResult.checks]
-  );
+  // All counts come from the verify.js result — nothing is counted twice.
+  const verification = scanResult.verification;
+  const counts = verification.counts;
 
   const blockingMissing = useMemo(
     () => BLOCKING_KEYS.filter(key => !data.fields[key]),
@@ -215,7 +209,7 @@ export function ResultsScreen({
           </Card>
         )}
 
-        {/* Verdict */}
+        {/* Verdict — label + confidence from the verify.js result */}
         <Card variant="elevated" className={riskBorderColor}>
           <div className="p-6">
             <div className="flex items-center gap-4">
@@ -225,7 +219,10 @@ export function ResultsScreen({
               <div className="flex-1">
                 <div className="flex items-center gap-2 mb-1 flex-wrap">
                   <Badge variant={RISK_BADGE_VARIANT[scanResult.riskLevel]} size="lg">
-                    {riskLevelLabels[scanResult.riskLevel]}
+                    {verification.label}
+                  </Badge>
+                  <Badge variant="outline" size="sm">
+                    confidence: {verification.confidence}
                   </Badge>
                   <Badge variant="outline" size="sm">
                     {scanResult.analyzer === 'vision-model' ? 'Vision model' : 'On-device OCR'}
@@ -273,6 +270,11 @@ export function ResultsScreen({
         {/* Medicine information from product dataset */}
         {scanResult.productInfo && (
           <MedicineInfoCard info={scanResult.productInfo} />
+        )}
+
+        {/* About this medicine — from the verify.js reference-record match */}
+        {verification.fromReference && (
+          <AboutMedicineCard fromReference={verification.fromReference} />
         )}
 
         {/* Batch information panel */}
@@ -368,6 +370,7 @@ export function ResultsScreen({
           <div className="space-y-1">
             {FIELD_LABELS.map(({ key, label, mono }) => {
               const field = data.fields[key];
+              const refValue = referenceFallbackValue(key, verification.fromReference);
               return (
                 <div key={key} className="py-2 border-b border-gray-100 last:border-0">
                   <div className="flex items-start justify-between gap-4">
@@ -386,18 +389,32 @@ export function ResultsScreen({
                           title={field.origin === 'user' ? 'entered by user' : `${field.confidence} confidence`}
                         />
                       </span>
+                    ) : refValue ? (
+                      // Empty in OCR but present in the matched reference record —
+                      // shown as reference data, never as "read from image".
+                      <span className="text-right">
+                        <span className="font-medium text-gray-700 text-sm">{refValue}</span>
+                        <span className="ml-2 inline-block rounded-full bg-secondary-100 text-secondary-700 px-2 py-0.5 text-[10px] leading-4 align-middle">
+                          from reference record (identified via formula/brand)
+                        </span>
+                      </span>
                     ) : (
                       <span className="text-gray-300 text-sm italic">Not found</span>
                     )}
                   </div>
-                  {field?.provenance?.matchedText && (
+                  {field?.provenance?.matchedText && !field.fromReference && (
                     <p className="mt-1 text-xs text-gray-400 text-right font-mono truncate">
                       from: "{field.provenance.matchedText}"
                       {field.origin === 'user' && ' · entered by user'}
                     </p>
                   )}
+                  {field?.fromReference && (
+                    <p className="mt-1 text-xs text-secondary-600 text-right">
+                      from reference record (identified via formula/brand)
+                    </p>
+                  )}
                   {/* Smart guidance + actions for missing edge-printed fields */}
-                  {!field && EDGE_PRINTED_KEYS.includes(key) && data.usable && (
+                  {!field && !refValue && EDGE_PRINTED_KEYS.includes(key) && data.usable && (
                     <div className="mt-1.5 flex flex-col items-end gap-1.5">
                       <p className="text-xs text-gray-500 text-right max-w-[280px]">{NOT_VISIBLE_MESSAGE}</p>
                       <div className="flex gap-2">
@@ -427,12 +444,12 @@ export function ResultsScreen({
           </div>
         </Card>
 
-        {/* Checks */}
+        {/* Checks — exactly the list from the verify.js result */}
         <Card variant="outlined" padding="md" className="mt-6">
-          <h3 className="font-semibold text-gray-900 mb-4">Verification Checks ({scanResult.checks.length})</h3>
+          <h3 className="font-semibold text-gray-900 mb-4">Verification Checks ({verification.checks.length})</h3>
           <div className="space-y-3">
-            {scanResult.checks.map(check => (
-              <CheckRow key={check.id} check={check} />
+            {verification.checks.map((check, index) => (
+              <CheckRow key={`${check.name}-${index}`} check={{ id: `verify-${index}`, ...check }} />
             ))}
           </div>
           {blockingMissing.length > 0 && (
@@ -669,6 +686,95 @@ function labelFor(key: FieldKey): string {
   return FIELD_LABELS.find(entry => entry.key === key)?.label ?? key;
 }
 
+/** Reference-record fallback for the five fillable card fields. */
+function referenceFallbackValue(
+  key: FieldKey,
+  fromReference: Verification['fromReference']
+): string | null {
+  if (!fromReference) return null;
+  switch (key) {
+    case 'brand_name':
+      return fromReference.brand || null;
+    case 'composition':
+      return fromReference.composition || null;
+    case 'dosage_form':
+      return fromReference.dosageForm || null;
+    case 'manufacturer_name':
+      return fromReference.manufacturer || null;
+    case 'manufacturing_license_no':
+      return fromReference.licenseNo || null;
+    default:
+      return null;
+  }
+}
+
+/** "About this medicine" — everything here comes from the reference record. */
+function AboutMedicineCard({ fromReference }: { fromReference: Verification['fromReference'] }) {
+  const [expanded, setExpanded] = useState(false);
+  if (!fromReference) return null;
+  return (
+    <Card variant="elevated" padding="md" className="mt-6 border-secondary-200">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h3 className="font-bold text-gray-900 text-base">About this medicine</h3>
+          <p className="text-xs text-gray-500 mt-0.5">
+            Reference record (identified via formula/brand)
+          </p>
+        </div>
+        <button
+          className="text-xs text-primary-600 font-medium shrink-0 mt-1"
+          onClick={() => setExpanded(prev => !prev)}
+          aria-expanded={expanded}
+        >
+          {expanded ? 'Show less' : 'Show more'}
+        </button>
+      </div>
+
+      <div className="mt-3 pt-3 border-t border-gray-100">
+        <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Brand</p>
+        <p className="text-sm text-gray-800">{fromReference.brand}</p>
+      </div>
+      <div className="mt-3 pt-3 border-t border-gray-100">
+        <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Drug class</p>
+        <p className="text-sm text-gray-800">{fromReference.drugClass}</p>
+      </div>
+      <div className="mt-3 pt-3 border-t border-gray-100">
+        <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Uses</p>
+        <p className="text-sm text-gray-800">{fromReference.uses}</p>
+      </div>
+
+      {expanded && (
+        <>
+          <div className="mt-3 pt-3 border-t border-gray-100">
+            <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Side effects</p>
+            <ul className="space-y-1">
+              {fromReference.sideEffects.map((effect, i) => (
+                <li key={i} className="text-sm text-gray-800 flex items-start gap-2">
+                  <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-warning-400 shrink-0" aria-hidden="true" />
+                  {effect}
+                </li>
+              ))}
+            </ul>
+          </div>
+          <div className="mt-3 pt-3 border-t border-gray-100">
+            <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Warnings</p>
+            <ul className="space-y-1">
+              {fromReference.warnings.map((warning, i) => (
+                <li key={i} className="text-sm text-gray-800 flex items-start gap-2">
+                  <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-danger-400 shrink-0" aria-hidden="true" />
+                  {warning}
+                </li>
+              ))}
+            </ul>
+          </div>
+        </>
+      )}
+
+      <p className="mt-3 text-xs text-gray-400">{fromReference.disclaimer}</p>
+    </Card>
+  );
+}
+
 const BOX_CLASSES: Record<TextLine['confidence'], string> = {
   high: 'border-primary-400 bg-primary-400/15',
   medium: 'border-warning-400 bg-warning-400/15',
@@ -859,8 +965,10 @@ function debugPayload(scan: ScanResult) {
       run: line.runLabel,
       bbox: line.bbox,
     })),
+    rawText: data.rawText,
     codes: data.codes.map(code => ({ format: code.format, payload: code.payload, source: code.source })),
     checks: scan.checks,
+    verification: scan.verification,
     photos: scan.photos.map(p => p.label),
     identification: scan.identification,
     drugClass: scan.drugClass,

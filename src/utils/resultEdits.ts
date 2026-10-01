@@ -1,6 +1,7 @@
 import type { ExtractionField, FieldKey, ScanResult } from '../types';
-import { computeOverall, computeScanQuality, runChecks } from './checks';
+import { computeScanQuality } from './checks';
 import { classifyComposition, identifyProduct, lookupBatchInfo } from '../services/identify';
+import { verify } from '../services/verifier';
 
 /**
  * Apply a user-entered value to a finished result and recompute checks,
@@ -14,7 +15,26 @@ export function applyManualEntry(scan: ScanResult, key: FieldKey, value: string)
   const field: ExtractionField = { value: trimmed, confidence: 'low', origin: 'user' };
   const fields = { ...scan.extractedData.fields, [key]: field };
   const data = { ...scan.extractedData, fields };
-  const checks = runChecks(data);
+  // Re-run the verifier so label/confidence/counts/checks stay driven by it.
+  const verification = verify({
+    rawText: data.rawText,
+    fields: {
+      batch: fields.batch_no?.value ?? '',
+      mfg: fields.mfg_date?.value ?? '',
+      exp: fields.expiry_date?.value ?? '',
+      manufacturer: fields.manufacturer_name?.value ?? fields.marketer_name?.value ?? '',
+      brand: fields.brand_name?.value ?? '',
+      composition: fields.composition?.value ?? '',
+      dosageForm: fields.dosage_form?.value ?? '',
+      mfgLicence: fields.manufacturing_license_no?.value ?? '',
+    },
+  });
+  const checks = verification.checks.map((check, index) => ({
+    id: `verify-${index}`,
+    name: check.name,
+    status: check.status,
+    reason: check.reason,
+  }));
   const userEnteredFields = scan.userEnteredFields.includes(key)
     ? scan.userEnteredFields
     : [...scan.userEnteredFields, key];
@@ -23,7 +43,8 @@ export function applyManualEntry(scan: ScanResult, key: FieldKey, value: string)
     ...scan,
     extractedData: data,
     checks,
-    riskLevel: computeOverall(checks),
+    verification,
+    riskLevel: verification.riskLevel,
     scanQuality: computeScanQuality(data, scan.skippedFields.length, userEnteredFields.length),
     userEnteredFields,
     identification: identifyProduct(

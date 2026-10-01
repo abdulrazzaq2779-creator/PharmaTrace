@@ -59,6 +59,15 @@ export function countMedicineKeywords(lines: TextLine[]): number {
   return MEDICINE_KEYWORDS.reduce((count, re) => (re.test(text) ? count + 1 : count), 0);
 }
 
+/**
+ * Join EVERY recognized line from ALL passes, bands, crops and rotations into
+ * one string. Not just the lines that matched a date/batch regex — the whole
+ * recognized text is the evidence the verifier searches.
+ */
+export function joinRawText(lines: Array<{ text: string }>): string {
+  return lines.map(l => l.text).map(t => t.replace(/\s+/g, ' ').trim()).filter(Boolean).join('\n');
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -407,6 +416,19 @@ function extractPillImprint(lines: TextLine[]): ExtractionField | null {
   return field(hit.match[1], 'low', hit.line, hit.match[0]);
 }
 
+/**
+ * A pill photo shows only a short imprint over a plain background. Blister
+ * foils and cartons carry this vocabulary — when any of it is present the
+ * photo is not classified as a pill, and lone codes like "R338" are junk
+ * (they are just part of the printed pack text).
+ */
+function photoIsPill(lines: TextLine[]): boolean {
+  const text = lines.map(l => l.text).join('\n');
+  const packVocabulary =
+    /\b(tablets?|capsules?|blister|strip|pack|box|carton|batch|b\.?\s*no|lot|mfg|mfd|exp|expiry|m\.?r\.?p|mrp|composition|schedule|store|keep out|mg\b|mcg\b|₹|mfg\.?\s*lic)/i;
+  return !packVocabulary.test(text) && countMedicineKeywords(lines) <= 1;
+}
+
 // ---------------------------------------------------------------------------
 // Main entry
 // ---------------------------------------------------------------------------
@@ -437,7 +459,7 @@ export function extractFields(lines: TextLine[], blurScore: number, codes: Decod
   fields.manufacturer_name = manufacturer;
   fields.marketer_name = marketer;
   fields.brand_name = extractBrand(lines);
-  fields.pill_imprint = extractPillImprint(lines);
+  fields.pill_imprint = photoIsPill(lines) ? extractPillImprint(lines) : null;
 
   tagSourceFields(lines, fields);
   const grounded = groundExtractedData({
@@ -448,6 +470,7 @@ export function extractFields(lines: TextLine[], blurScore: number, codes: Decod
     keywordHits,
     fields,
     candidates,
+    rawText: joinRawText(lines),
     rawTextLines: lines,
     allOcrLines: lines,   // pipeline overrides this with the full unfiltered set after the call
     unreadableRegions: findUnreadableRegions(lines),
@@ -538,6 +561,7 @@ export function mergeExtractedData(base: ExtractedData, incoming: ExtractedData)
     keywordHits: Math.max(base.keywordHits, incoming.keywordHits),
     fields,
     candidates,
+    rawText: joinRawText([...base.rawTextLines, ...incoming.rawTextLines]),
     rawTextLines: [...base.rawTextLines, ...incoming.rawTextLines],
     allOcrLines: [...(base.allOcrLines ?? []), ...(incoming.allOcrLines ?? [])],
     unreadableRegions: [...base.unreadableRegions, ...incoming.unreadableRegions],

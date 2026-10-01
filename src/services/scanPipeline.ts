@@ -1,5 +1,5 @@
 import { createWorker, type PSM } from 'tesseract.js';
-import type { BBox, CaptureSource, DecodedCode, ExtractedData, ExtractionField, FieldKey, ScanResult, SessionPhoto, TextLine } from '../types';
+import type { BBox, CaptureSource, CheckResult, DecodedCode, ExtractedData, ExtractionField, FieldKey, ScanResult, SessionPhoto, TextLine } from '../types';
 import {
   adaptiveThreshold,
   canvasToJpeg,
@@ -15,9 +15,10 @@ import {
   tallNarrowCrops,
   upscaleForOcr,
 } from '../utils/image';
-import { extractFields, groundExtractedData, mergeExtractedData } from './extract';
+import { extractFields, groundExtractedData, joinRawText, mergeExtractedData } from './extract';
 import { decodeCodes } from './barcode';
-import { computeOverall, computeScanQuality, runChecks } from '../utils/checks';
+import { computeScanQuality } from '../utils/checks';
+import { verify } from './verifier';
 import { generateId } from '../utils/helpers';
 
 export interface ScanProgress {
@@ -187,6 +188,74 @@ function mapFromUpscaledRotated(
 }
 
 const STRIP_MIN_EDGE = 1600;
+/** Composition-block crops must be upscaled to at least this many px. */
+const COMPOSITION_MIN_EDGE = 1600;
+
+/**
+ * Dedicated composition-block passes: the left 50% and the right 30% of the
+ * image, each rotated upright, upscaled to ≥1600px, grayscale with contrast
+ * normalization, run on page-segmentation modes 6 and 11. All text found is
+ * appended to rawText (via the returned lines).
+ */
+async function recognizeCompositionCrops(
+  worker: Awaited<ReturnType<typeof createWorker>>,
+  source: HTMLCanvasElement,
+  onProgress: (p: ScanProgress) => void
+): Promise<TextLine[]> {
+  const w = source.width;
+  const h = source.height;
+  const leftW = Math.max(24, Math.round(w * 0.5));
+  const rightW = Math.max(24, Math.round(w * 0.3));
+  const crops: Array<{ label: string; bbox: BBox }> = [
+    { label: 'left-50', bbox: { x0: 0, y0: 0, x1: leftW, y1: h } },
+    { label: 'right-30', bbox: { x0: Math.max(0, w - rightW), y0: 0, x1: w, y1: h } },
+  ];
+
+  const lines: TextLine[] = [];
+  const totalRuns = crops.length * 2; // 2 PSM modes per crop
+  let run = 0;
+  for (const crop of crops) {
+    const region = cropRegion(source, crop.bbox);
+    if (region.width < 8 || region.height < 8) continue;
+    // Rotated upright, upscaled to at least 1600px, grayscale + contrast.
+    const upright = rotateQuarter(region, 0);
+    const upscaled = upscaleForOcr(upright, COMPOSITION_MIN_EDGE);
+    const gray = grayscaleNormalized(upscaled);
+    const scale = upscaled.width / Math.max(1, region.width);
+    for (const psm of [6, 11] as const) {
+      await worker.setParameters({ tessedit_pageseg_mode: psm as unknown as PSM });
+      const result = await worker.recognize(gray, {}, { blocks: true });
+      const found = linesFromTesseract(result.data).filter(l => passesQualityFilter(l, 30, 0.25));
+      run += 1;
+      onProgress({
+        phase: 'variants',
+        message: `Composition block ${crop.label} psm${psm}: ${found.length} lines`,
+        scanLinePct: 90,
+        completedRuns: [`composition·${crop.label}·psm${psm}`],
+        totalRuns,
+        lastRunLines: found.slice(0, 4).map(l => l.text.trim()),
+      });
+      for (const line of found) {
+        lines.push({
+          text: line.text,
+          bbox: {
+            x0: crop.bbox.x0 + line.bbox.x0 / scale,
+            y0: crop.bbox.y0 + line.bbox.y0 / scale,
+            x1: crop.bbox.x0 + line.bbox.x1 / scale,
+            y1: crop.bbox.y0 + line.bbox.y1 / scale,
+          },
+          band: 0,
+          confidence: confidenceFromTesseract(line.confidence),
+          wordConfidence: line.confidence,
+          runLabel: `composition·${crop.label}·psm${psm}`,
+          orientation: 0,
+        });
+      }
+    }
+  }
+  console.log('composition-crop OCR lines', lines.length, 'from', run, 'runs');
+  return lines;
+}
 
 async function recognizeDedicatedStrips(
   worker: Awaited<ReturnType<typeof createWorker>>,
@@ -333,7 +402,7 @@ async function recognizeAll(
         const label = `${variant.label}·${turns * 90}°·${psm.label}`;
         await worker.setParameters({ tessedit_pageseg_mode: psm.mode as unknown as PSM });
         const result = await worker.recognize(oriented, {}, { blocks: true });
-        const lines = linesFromTesseract(result.data).filter(passesQualityFilter);
+        const lines = linesFromTesseract(result.data).filter(l => passesQualityFilter(l));
         const meanConfidence =
           lines.length > 0 ? lines.reduce((s, l) => s + l.confidence, 0) / lines.length : 0;
         runs.push({
@@ -402,13 +471,12 @@ export interface ScanInput {
   photoLabel: string;
 }
 
+type InterimScanResult = ReturnType<typeof buildResult>;
+
 export async function runScan(
   input: ScanInput,
   onProgress: (progress: ScanProgress) => void
-): Promise<{
-  result: Omit<ScanResult, 'photos' | 'skippedFields' | 'userEnteredFields' | 'identification' | 'drugClass' | 'batchInfo'>;
-  raw: unknown;
-}> {
+): Promise<{ result: InterimScanResult; raw: unknown }> {
   console.log('image received', input.photoLabel, input.file.size, input.file.type);
 
   onProgress(progressFor('preparing', 'Preparing image…', 0, [], 0, []));
@@ -445,10 +513,15 @@ export async function runScan(
         if (stripLines.length > 0) {
           data = mergeExtractedData(data, extractFields(stripLines, blurScore, codes));
         }
+        const compositionLines = await recognizeCompositionCrops(worker, sourceCanvas, onProgress);
+        if (compositionLines.length > 0) {
+          data = mergeExtractedData(data, extractFields(compositionLines, blurScore, codes));
+        }
       } finally {
         await worker.terminate();
       }
       data = groundExtractedData(data);
+      data.rawText = joinRawText(data.rawTextLines);
       logSessionParse(data);
       onProgress(progressFor('extracting', 'Building result…', 100, [], 100, []));
       return {
@@ -490,7 +563,7 @@ export async function runScan(
     for (const band of bands) {
       const bandResult = await worker.recognize(band.canvas, {}, { blocks: true });
       const bandRun = linesFromTesseract(bandResult.data)
-        .filter(passesQualityFilter)
+        .filter(l => passesQualityFilter(l))
         .map(line => ({
           text: line.text,
           bbox: { ...line.bbox, y0: line.bbox.y0 + band.y0, y1: line.bbox.y1 + band.y0 } as BBox,
@@ -529,12 +602,14 @@ export async function runScan(
       [...allPasses, ...bandLines].flat().map(l => l.bbox),
       onProgress
     );
-    const merged = mergeLines([...allPasses, ...bandLines, stripLines]);
+    // Composition-block passes: left 50% / right 30% crops, psm 6 + 11.
+    const compositionLines = await recognizeCompositionCrops(worker, sourceCanvas, onProgress);
+    const merged = mergeLines([...allPasses, ...bandLines, stripLines, compositionLines]);
     console.log('merged raw text', merged.map(l => l.text).join(' | '));
-    console.log('merged lines', merged.length, 'from', allPasses.length + bandLines.length + 1, 'passes');
+    console.log('merged lines', merged.length, 'from', allPasses.length + bandLines.length + 2, 'passes');
 
     // Collect ALL lines without the quality filter — used only for dataset keyword matching.
-    const allOcrLines: TextLine[] = runs.flatMap((run, i) => {
+    const allOcrLines: TextLine[] = runs.flatMap(run => {
       const [variantLabel, rotationLabel] = run.label.split('·');
       const turns = parseInt(rotationLabel, 10) / 90;
       const size = variantSizes[variantLabel] ?? { w: width, h: height };
@@ -554,6 +629,8 @@ export async function runScan(
     const data = extractFields(merged, blurScore, codes);
     // Override allOcrLines with the full unfiltered set so dataset matching has everything.
     data.allOcrLines = allOcrLines;
+    // rawText = EVERY recognized line from ALL passes, bands, crops and rotations.
+    data.rawText = joinRawText(merged);
     logSessionParse(data);
 
     if (!data.fields.qr_or_barcode_present) {
@@ -584,17 +661,38 @@ function buildResult(
   analyzer: ScanResult['analyzer'],
   imageWidth: number,
   imageHeight: number
-): Omit<ScanResult, 'photos' | 'skippedFields' | 'userEnteredFields' | 'identification' | 'drugClass' | 'batchInfo'> {
-  const checks = runChecks(data);
+): Omit<ScanResult, 'photos' | 'skippedFields' | 'userEnteredFields' | 'identification' | 'drugClass' | 'batchInfo' | 'productInfo'> {
+  // The verify.js result drives the per-photo interim result too (label,
+  // confidence, counts, checks) — same source as the final assembled result.
+  const verification = verify({
+    rawText: data.rawText,
+    fields: {
+      batch: data.fields.batch_no?.value ?? '',
+      mfg: data.fields.mfg_date?.value ?? '',
+      exp: data.fields.expiry_date?.value ?? '',
+      manufacturer: data.fields.manufacturer_name?.value ?? data.fields.marketer_name?.value ?? '',
+      brand: data.fields.brand_name?.value ?? '',
+      composition: data.fields.composition?.value ?? '',
+      dosageForm: data.fields.dosage_form?.value ?? '',
+      mfgLicence: data.fields.manufacturing_license_no?.value ?? '',
+    },
+  });
+  const checks: CheckResult[] = verification.checks.map((check, index) => ({
+    id: `verify-${index}`,
+    name: check.name,
+    status: check.status,
+    reason: check.reason,
+  }));
   return {
     id: generateId(),
     timestamp: new Date().toISOString(),
     imageUrl: thumbnail,
     captureSource: source,
     analyzer,
-    riskLevel: computeOverall(checks),
+    riskLevel: verification.riskLevel,
     extractedData: data,
     checks,
+    verification,
     scanQuality: computeScanQuality(data),
     imageWidth,
     imageHeight,

@@ -11,12 +11,15 @@ import type {
   RiskLevel,
   ScanResult,
   SessionPhoto,
+  TextLine,
 } from '../types';
 import { BLOCKING_KEYS, COLLECTION_STEPS } from '../types';
 import { runScan, ScanError, type ScanProgress } from '../services/scanPipeline';
-import { computeOverall, computeScanQuality, runChecks } from '../utils/checks';
+import { computeScanQuality } from '../utils/checks';
 import { generateId } from '../utils/helpers';
 import { classifyComposition, identifyProduct, lookupBatchInfo, lookupProductInfo } from '../services/identify';
+import { joinRawText } from '../services/extract';
+import { verify } from '../services/verifier';
 
 export type SessionStage = 'idle' | 'analyzing' | 'collecting' | 'done';
 
@@ -57,7 +60,8 @@ function assembleResult(
   photos: SessionPhoto[],
   skippedFields: FieldKey[],
   userEnteredFields: FieldKey[],
-  userTypedName: string | null
+  userTypedName: string | null,
+  sessionLines: TextLine[]
 ): ScanResult {
   // Try to match the product from the dataset using both structured fields
   // and raw OCR lines — this works even when the parser extracted nothing.
@@ -69,8 +73,39 @@ function assembleResult(
     ? patchFieldsFromDataset(fields, productInfo)
     : fields;
 
-  const data: ExtractedData = { ...firstPass.data, fields: patchedFields };
-  const checks = runChecks(data);
+  // rawText from ALL photos in this session: a second photo of the sideways
+  // edge adds its text to the first photo's text.
+  const lines = sessionLines.length > 0 ? sessionLines : firstPass.data.rawTextLines;
+  const data: ExtractedData = {
+    ...firstPass.data,
+    fields: patchedFields,
+    rawTextLines: lines,
+    allOcrLines: sessionLines.length > 0 ? sessionLines : firstPass.data.allOcrLines ?? firstPass.data.rawTextLines,
+    rawText: joinRawText(lines),
+  };
+
+  // The verify.js result drives the whole results screen: label, confidence,
+  // counts and the checks list. No counts outside result.checks.
+  const verification = verify({
+    rawText: data.rawText,
+    fields: {
+      batch: patchedFields.batch_no?.value ?? '',
+      mfg: patchedFields.mfg_date?.value ?? '',
+      exp: patchedFields.expiry_date?.value ?? '',
+      manufacturer: patchedFields.manufacturer_name?.value ?? patchedFields.marketer_name?.value ?? '',
+      brand: patchedFields.brand_name?.value ?? '',
+      composition: patchedFields.composition?.value ?? '',
+      dosageForm: patchedFields.dosage_form?.value ?? '',
+      mfgLicence: patchedFields.manufacturing_license_no?.value ?? '',
+    },
+  });
+  const checks: CheckResult[] = verification.checks.map((check, index) => ({
+    id: `verify-${index}`,
+    name: check.name,
+    status: check.status,
+    reason: check.reason,
+  }));
+
   const identification = identifyProduct(patchedFields, data.codes, data.rawTextLines, userTypedName ?? undefined);
   return {
     id: generateId(),
@@ -78,9 +113,10 @@ function assembleResult(
     imageUrl: firstPass.imageUrl,
     captureSource: firstPass.captureSource,
     analyzer: firstPass.analyzer,
-    riskLevel: computeOverall(checks),
+    riskLevel: verification.riskLevel,
     extractedData: data,
     checks,
+    verification,
     scanQuality: computeScanQuality(data, skippedFields.length, userEnteredFields.length),
     imageWidth: firstPass.imageWidth,
     imageHeight: firstPass.imageHeight,
@@ -108,6 +144,7 @@ function patchFieldsFromDataset(
     confidence: 'medium' as const,
     origin: 'image' as const,
     grounded: true,
+    fromReference: true,
     matchQuality: 'strict' as const,
     provenance: { matchedText: value, runLabel: 'dataset-match' },
   });
@@ -153,7 +190,7 @@ export function userField(value: string): ExtractionField {
 
 /** What startScan resolves to: the pipeline result plus where the session went. */
 export interface StartScanOutcome {
-  result: Omit<ScanResult, 'photos' | 'skippedFields' | 'userEnteredFields' | 'identification' | 'drugClass' | 'batchInfo'>;
+  result: Omit<ScanResult, 'photos' | 'skippedFields' | 'userEnteredFields' | 'identification' | 'drugClass' | 'batchInfo' | 'productInfo' | 'verification'>;
   stage: SessionStage;
   /** Fully-built ScanResult when the session went straight to 'done'. */
   final: ScanResult | null;
@@ -186,6 +223,8 @@ export function useScanSession() {
       checks: CheckResult[];
     } | null
   >(null);
+  /** Every OCR line from ALL photos this session — rawText grows per photo. */
+  const [sessionLines, setSessionLines] = useState<TextLine[]>([]);
   /** Name the user typed for identification (fallback chain step e). */
   const userTypedName = useRef<string | null>(null);
 
@@ -198,6 +237,7 @@ export function useScanSession() {
     setSkippedFields([]);
     setUserEnteredFields([]);
     setFirstPass(null);
+    setSessionLines([]);
     userTypedName.current = null;
   }, []);
 
@@ -237,6 +277,8 @@ export function useScanSession() {
         const mergedFields = mergeFields(emptyFields(), result.extractedData.fields);
         setPhotos([photo]);
         setFields(mergedFields);
+        // Second photo of the sideways edge adds to the first photo's text.
+        setSessionLines(result.extractedData.rawTextLines);
         setFirstPass({
           data: result.extractedData,
           imageUrl: result.imageUrl,
@@ -277,7 +319,8 @@ export function useScanSession() {
             [photo],
             [],
             [],
-            userTypedName.current
+            userTypedName.current,
+            result.extractedData.rawTextLines
           );
           console.log('[session] stage → done', datasetMatch ? `(dataset match: ${datasetMatch.brand})` : '(all blocking fields present)');
           return { result, stage: 'done', final };
@@ -313,6 +356,7 @@ export function useScanSession() {
           addedAt: result.timestamp,
         };
         setPhotos(prev => [...prev, photo]);
+        setSessionLines(prev => [...prev, ...result.extractedData.rawTextLines]);
         setFields(prev => {
           const merged = mergeFields(prev, result.extractedData.fields);
           console.log(
@@ -344,6 +388,7 @@ export function useScanSession() {
       try {
         const blob = await (await fetch(photo.dataUrl)).blob();
         const result = await runPhoto(blob, 'camera', `crop of ${photo.label}`, crop);
+        setSessionLines(prev => [...prev, ...result.extractedData.rawTextLines]);
         if (stepId) {
           const step = COLLECTION_STEPS.find(s => s.id === stepId);
           setFields(prev => {
@@ -409,8 +454,8 @@ export function useScanSession() {
   /** Build the final result from everything collected so far. */
   const finish = useCallback((): ScanResult | null => {
     if (!firstPass) return null;
-    return assembleResult(firstPass, fields, photos, skippedFields, userEnteredFields, userTypedName.current);
-  }, [firstPass, fields, photos, skippedFields, userEnteredFields]);
+    return assembleResult(firstPass, fields, photos, skippedFields, userEnteredFields, userTypedName.current, sessionLines);
+  }, [firstPass, fields, photos, skippedFields, userEnteredFields, sessionLines]);
 
   return {
     stage,

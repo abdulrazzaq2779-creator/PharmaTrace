@@ -365,7 +365,7 @@ export function lookupProductInfo(
     let score = 0;
 
     // 1. Brand keyword (4 pts — strongest signal)
-    for (const kw of entry.brandKeywords) {
+    for (const kw of entry.brandKeywords ?? []) {
       if (allText.includes(kw.toLowerCase())) score += 4;
     }
 
@@ -377,7 +377,7 @@ export function lookupProductInfo(
     }
 
     // 3. Manufacturer keyword (1 pt each)
-    for (const kw of entry.manufacturerKeywords) {
+    for (const kw of entry.manufacturerKeywords ?? []) {
       if (allText.includes(kw.toLowerCase())) score += 1;
     }
 
